@@ -36,8 +36,20 @@ WHAT THIS FILE DOES (matches the JSON graph node-for-node)
    DECODE  : VAEDecode(tiled) + LTXVAudioVAEDecode  -> VHS_VideoCombine (+ ffmpeg mux)
 
 Target Hardware: Google Colab Free-Tier T4 (15GB VRAM | ~12.7GB RAM).
-Zero-crash strategy = sequential model residency + 1.2GB VRAM shield + 16GB swap
-+ tiled VAE decode + SageAttention + ChunkFeedForward + aggressive purges.
+
+FREE-TIER RAM SURVIVAL (the reason earlier runs crashed)
+-------------------------------------------------------------------------------
+The 22B DiT is huge and Colab's sandbox BLOCKS swap (swapon fails -> 0GB), so the
+model must survive in physical RAM. Three things make that possible here:
+  1. DIT_QUANT="Q3_K_S" (10.3GB, memory-mapped/evictable) instead of Q4_K_M
+     (14.3GB > total free RAM -> guaranteed OOM).
+  2. The Gemma-3-12B text encoder is FORCED onto the GPU (VRAM), not host RAM,
+     via mm.text_encoder_device -> cuda. (Dropping this was what OOM'd v-first-cut.)
+  3. Sequential residency: CLIP is evicted the instant LTXDirector finishes; the
+     DiT is freed before VAE decode. Plus 1.2GB VRAM shield, tiled decode,
+     SageAttention, ChunkFeedForward, and mem_status() logging at every step.
+If it still OOMs on free tier, use a Colab High-RAM runtime (~51GB) OR lower
+END_FRAME / custom_width / custom_height. Full 1280x720 needs a High-RAM box.
 ================================================================================
 """
 
@@ -88,6 +100,10 @@ try:
     import psutil
     sw = psutil.swap_memory()
     print(f"  Memory: RAM {psutil.virtual_memory().available/1e9:.2f} GB free | Swap {sw.total/1e9:.2f} GB")
+    if sw.total < (1 * 1024 * 1024 * 1024):
+        print("   NOTE: Swap is 0 GB. Colab's sandbox blocks swapon, so there is NO")
+        print("        RAM safety net. The DiT MUST fit in physical RAM -> keep")
+        print("        DIT_QUANT small (Q3_K_S) and the text encoder on the GPU.")
 except Exception:
     pass
 
@@ -233,13 +249,20 @@ def link_file_safe(src_path: str, dst_path: str):
             pass
 
 
-print("Downloading LTX-2.3 core models...")
+# DiT quantization. On a FREE Colab T4 (~12.7GB RAM) the Q4_K_M file is 14.3GB
+# and cannot fit even memory-mapped alongside the working set -> use Q3_K_S
+# (10.3GB) or Q3_K_M (11.1GB). Use Q4_K_M/Q5/Q6 only on High-RAM runtimes.
+#   Options: Q3_K_S, Q3_K_M, Q4_K_S, Q4_K_M, Q5_K_M, Q6_K, Q8_0
+DIT_QUANT = "Q3_K_S"
+DIT_GGUF_FILENAME = f"ltx-2-3-22b-dev-{DIT_QUANT}.gguf"
+
+print(f"Downloading LTX-2.3 core models (DiT quant: {DIT_QUANT}) ...")
 
 dit_model = download_file(
-    "https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/ltx-2-3-22b-dev-Q4_K_M.gguf",
-    "/content/ComfyUI/models/unet", filename="ltx-2-3-22b-dev-Q4_K_M.gguf")
-link_file_safe("/content/ComfyUI/models/unet/ltx-2-3-22b-dev-Q4_K_M.gguf",
-               "/content/ComfyUI/models/diffusion_models/ltx-2-3-22b-dev-Q4_K_M.gguf")
+    f"https://huggingface.co/vantagewithai/LTX-2.3-GGUF/resolve/main/dev/{DIT_GGUF_FILENAME}",
+    "/content/ComfyUI/models/unet", filename=DIT_GGUF_FILENAME)
+link_file_safe(f"/content/ComfyUI/models/unet/{DIT_GGUF_FILENAME}",
+               f"/content/ComfyUI/models/diffusion_models/{DIT_GGUF_FILENAME}")
 
 text_encoder_model = download_file(
     "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors",
@@ -486,8 +509,32 @@ def patch_comfy_memory_manager():
                     return 2 * 1024 * 1024 * 1024
             mm.get_free_memory = _buffered_get_free_memory
             mm._is_free_memory_patched = True
+
+        # CRITICAL for free-tier RAM: keep the Gemma text encoder in VRAM, not host
+        # RAM. Without this, DualCLIPLoader puts ~7-8GB of Gemma weights into the
+        # 12.7GB host RAM and the LTXDirector call OOMs the session.
+        if torch.cuda.is_available():
+            mm.text_encoder_device = lambda: torch.device("cuda")
+            mm.text_encoder_offload_device = lambda: torch.device("cuda")
     except Exception as e:
         print(f"Memory patch notice: {e}")
+
+
+def mem_status(tag: str = ""):
+    """Print host RAM + GPU VRAM so we can see exactly where memory goes."""
+    try:
+        import psutil
+        ram = psutil.virtual_memory()
+        msg = f"  [MEM {tag}] RAM {ram.available/1e9:.1f}/{ram.total/1e9:.1f} GB free"
+    except Exception:
+        msg = f"  [MEM {tag}]"
+    try:
+        if torch.cuda.is_available():
+            free_v, total_v = torch.cuda.mem_get_info()
+            msg += f" | VRAM {free_v/1e9:.1f}/{total_v/1e9:.1f} GB free"
+    except Exception:
+        pass
+    print(msg)
 
 
 def patch_safetensors_direct_to_gpu():
@@ -838,7 +885,7 @@ def load_dit_with_loras():
     """UnetLoaderGGUF -> apply LoRA stack -> ModelPreviewOverrideKJ -> SageAttention
     -> ChunkFeedForward. Mirrors the JSON's model preparation chain."""
     purge_deep("pre_dit_load")
-    model = out(call_node(N("UnetLoaderGGUF"), unet_name="ltx-2-3-22b-dev-Q4_K_M.gguf"), 0)
+    model = out(call_node(N("UnetLoaderGGUF"), unet_name=DIT_GGUF_FILENAME), 0)
 
     lora_cls = NODE_CLASS_MAPPINGS.get("LoraLoaderGGUF", LoraLoaderModelOnly)
     for cfg in LORA_STACK:
@@ -966,20 +1013,23 @@ def run_faithful_pipeline(workdir="/content/LTXDirector_Work",
         # ───────────────────────────────────────────────────────────────────
         print("\n" + "=" * 70 + "\nPHASE 1: LTXDirector Master Timeline Controller\n" + "=" * 70)
         ram_guard(2.0, "phase1")
+        mem_status("start")
 
-        print("  Loading DualCLIP (Gemma-3-12B) ...")
-        clip = out(call_node(N("DualCLIPLoader"),
-                             clip_name1="gemma_3_12B_it_fp4_mixed.safetensors",
-                             clip_name2="ltx-2.3_text_projection_bf16.safetensors",
-                             type="ltxv", device="default"), 0)
+        print("  Loading DiT (GGUF, memory-mapped) + 4-LoRA stack + hooks ...")
+        base_model = load_dit_with_loras()
+        mem_status("after DiT+LoRA")
 
         print("  Loading audio VAE ...")
         audio_vae = load_vae(vae_audio_model, device="main_device", dtype="fp16")
 
-        print("  Loading DiT (GGUF) + 4-LoRA stack + hooks ...")
-        base_model = load_dit_with_loras()
+        print("  Loading DualCLIP (Gemma-3-12B -> forced to VRAM) ...")
+        clip = out(call_node(N("DualCLIPLoader"),
+                             clip_name1="gemma_3_12B_it_fp4_mixed.safetensors",
+                             clip_name2="ltx-2.3_text_projection_bf16.safetensors",
+                             type="ltxv", device="default"), 0)
+        mem_status("after CLIP")
 
-        print("  Running LTXDirector (this encodes prompts + builds the whole timeline) ...")
+        print("  Running LTXDirector (encodes prompts + builds the whole timeline) ...")
         d = call_node(
             N("LTXDirector"),
             model=base_model, clip=clip, audio_vae=audio_vae,
@@ -1006,10 +1056,12 @@ def run_faithful_pipeline(workdir="/content/LTXDirector_Work",
         combined_audio = out(d, 7)
         del d
 
+        mem_status("after LTXDirector")
         # Free the Gemma text encoder now; keep patched_model (holds segment masks)
         del clip
         purge_clip(["clip"])
-        print(f"  ok LTXDirector done. Free RAM {get_ram_free_gb():.2f} GB")
+        print("  ok LTXDirector done.")
+        mem_status("after CLIP purge")
 
         # Conditioning: negative = zero-out of the director positive; wrap for LTXV
         neg_raw = out(call_node(N("ConditioningZeroOut"), conditioning=director_positive), 0)
@@ -1057,6 +1109,7 @@ def run_faithful_pipeline(workdir="/content/LTXDirector_Work",
         s1_out = sync_latent_device(out(r1, 0), "cpu")
         del av1, r1, guider1, noise, sig1, s1_model
         clear_memory(light=True)
+        mem_status("after stage1 sample")
 
         sep1 = call_node(N("LTXVSeparateAVLatent"), av_latent=s1_out)
         v1 = sync_latent_device(out(sep1, 0), "cpu")
@@ -1111,6 +1164,7 @@ def run_faithful_pipeline(workdir="/content/LTXDirector_Work",
                        sampler=ks_euler, sigmas=sig2, latent_image=av2)
         s2_out = sync_latent_device(out(r2, 0), "cpu")
         del av2, r2, guider2, noise2, sig2, s2_model
+        mem_status("after stage2 sample")
 
         # Free the big DiT now; only VAE decode remains
         del patched_model, base_model
