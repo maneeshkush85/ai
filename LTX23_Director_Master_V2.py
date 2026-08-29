@@ -2356,3 +2356,109 @@ if __name__ == "__main__":
         use_song_audio=USE_SONG_AUDIO,
     )
     print(f"\n🎬 Your synchronized music video is ready:\n   {final_output_file}")
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CELL 18: QUALITY SELF-CHECK  (thumbnails + objective diagnostics)
+# ════════════════════════════════════════════════════════════════════════════
+# You (or the assistant, if you share the JPEGs) can eyeball the thumbnails to
+# judge identity / distortion / lighting; the metrics flag obvious failures
+# (black or frozen frames, video/audio duration mismatch = lip-sync drift).
+def quality_self_check(video_path: str, outdir: str = "/content/LTXStudio_Output",
+                       n_thumbs: int = 6) -> Dict[str, Any]:
+    print("\n" + "=" * 70 + "\n🔎 QUALITY SELF-CHECK\n" + "=" * 70)
+    report: Dict[str, Any] = {"video": video_path}
+    if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+        print(f"  ❌ Output missing/empty: {video_path}")
+        return report
+
+    def _probe(stream, entries):
+        cmd = (f'ffprobe -v error -select_streams {stream} '
+               f'-show_entries {entries} -of default=nw=1 "{video_path}"')
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+
+    vinfo = _probe("v:0", "stream=width,height,r_frame_rate,nb_read_packets,duration")
+    ainfo = _probe("a:0", "stream=codec_name,duration,sample_rate,channels")
+    print("  🎞️  Video:", vinfo.replace("\n", " ") or "(none)")
+    print("  🔊 Audio:", ainfo.replace("\n", " ") or "(none — video only!)")
+
+    # Video vs audio duration → lip-sync drift check.
+    def _get(info, key):
+        for line in info.splitlines():
+            if line.startswith(key + "="):
+                try:
+                    return float(line.split("=", 1)[1])
+                except Exception:
+                    return None
+        return None
+    vd, ad = _get(vinfo, "duration"), _get(ainfo, "duration")
+    if vd and ad:
+        drift = abs(vd - ad)
+        flag = "✅ OK" if drift < 0.5 else "⚠️ possible lip-sync drift"
+        print(f"  ⏱️  Durations: video {vd:.2f}s | audio {ad:.2f}s | Δ {drift:.2f}s  {flag}")
+
+    # Extract evenly-spaced thumbnails for visual inspection.
+    thumb_dir = os.path.join(outdir, "thumbnails")
+    os.makedirs(thumb_dir, exist_ok=True)
+    for f in glob.glob(os.path.join(thumb_dir, "*.jpg")):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    dur = vd or 30.0
+    thumbs = []
+    for i in range(n_thumbs):
+        t = max(0.1, dur * (i + 0.5) / n_thumbs)
+        out = os.path.join(thumb_dir, f"thumb_{i:02d}.jpg")
+        run_cmd(f'ffmpeg -y -ss {t:.2f} -i "{video_path}" -frames:v 1 -q:v 2 "{out}"')
+        if os.path.exists(out):
+            thumbs.append(out)
+    report["thumbnails"] = thumbs
+    print(f"  🖼️  Saved {len(thumbs)} thumbnails → {thumb_dir}")
+
+    # Objective black / frozen-frame detection via numpy on the thumbnails.
+    try:
+        from PIL import Image as _Im
+        means, prev, frozen = [], None, 0
+        for tpath in thumbs:
+            a = np.asarray(_Im.open(tpath).convert("L"), dtype=np.float32)
+            means.append(a.mean())
+            if prev is not None and np.abs(a - prev).mean() < 2.0:
+                frozen += 1
+            prev = a
+        if means:
+            dark = sum(1 for m in means if m < 8)
+            print(f"  💡 Brightness (0-255) across thumbs: "
+                  f"min {min(means):.0f} / avg {sum(means)/len(means):.0f} / max {max(means):.0f}")
+            if dark:
+                print(f"  ⚠️ {dark}/{len(means)} thumbnails look almost BLACK — check the decode/keyframes.")
+            if frozen:
+                print(f"  ⚠️ {frozen} near-identical consecutive thumbnails — motion may be too static.")
+            if not dark and not frozen:
+                print("  ✅ Frames are bright and changing (no obvious black/frozen failure).")
+    except Exception as e:
+        print(f"  [notice] frame analysis skipped ({e}).")
+
+    # Try to preview inline if running inside a notebook.
+    try:
+        from IPython.display import Image as _IPyImage, display
+        for t in thumbs:
+            display(_IPyImage(filename=t, width=320))
+    except Exception:
+        pass
+
+    print("=" * 70)
+    print(f"  👉 Download the thumbnails from: {thumb_dir}")
+    print("     Share one here and I can visually assess identity / distortion / quality.")
+    print("=" * 70 + "\n")
+    return report
+
+
+# Auto-run the self-check if a master video already exists.
+_final_mp4 = os.path.join(OUTPUT_DIRECTORY, "LTX23_Director_Master_30s.mp4")
+if os.path.exists(_final_mp4):
+    quality_self_check(_final_mp4, outdir=OUTPUT_DIRECTORY)
+else:
+    print("ℹ️ Cell 18 ready: run the generation, then call "
+          "quality_self_check('/content/LTXStudio_Output/LTX23_Director_Master_30s.mp4').")
