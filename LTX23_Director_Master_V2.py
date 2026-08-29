@@ -680,6 +680,11 @@ SCENE_MODE = str(scene_mode)
 RELOAD_DIT_PER_SCENE = bool(reload_dit_per_scene)
 SCENE_CHUNK_LATENT_FRAMES = max(2, int(round((scene_chunk_seconds * fps) / 8)))
 SCENE_OVERLAP_LATENT_FRAMES = max(0, int(round(scene_overlap_frames / 8)))
+# HARD CAP on any single diffusion chunk (in LATENT frames). A T4 can only hold
+# ~24 latent frames (~185 px frames) of Stage-2 @ 832x512 activations; bigger
+# chunks (e.g. a long 2-keyframe timeline → 55-frame chunk = 433 px) OOM-kill the
+# runtime. Long keyframe scenes are auto-split into sub-chunks below this cap.
+MAX_SCENE_LAT_FRAMES = 24
 BASE_SEED = int(base_seed)
 OUTPUT_CRF = int(output_crf)
 RESUME_CHECKPOINTS = bool(resume_checkpoints)
@@ -1851,6 +1856,25 @@ def _keyframe_scene_ranges(Tv: int) -> List[Tuple[int, int]]:
     return ranges
 
 
+def _cap_scene_ranges(ranges: List[Tuple[int, int]], max_len: int) -> List[Tuple[int, int]]:
+    """Split any scene range longer than `max_len` latent frames into safe
+    sub-chunks. Prevents a long keyframe scene (e.g. a 2-keyframe timeline giving a
+    55-frame / 433-px chunk) from OOM-killing the T4 during Stage-2 @ 832x512."""
+    if max_len is None or max_len <= 0:
+        return ranges
+    out: List[Tuple[int, int]] = []
+    for s, e in ranges:
+        if (e - s) <= max_len:
+            out.append((s, e))
+            continue
+        cur = s
+        while cur < e:
+            nxt = min(cur + max_len, e)
+            out.append((cur, nxt))
+            cur = nxt
+    return out
+
+
 def _fixed_scene_ranges(Tv: int, chunk: int, overlap: int) -> List[Tuple[int, int]]:
     chunk = max(2, min(chunk, Tv))
     overlap = max(0, min(overlap, chunk - 1))
@@ -1886,6 +1910,13 @@ def execute_phase_b_batched(director_state: Dict[str, Any], model: Any, seed: in
         scene_ranges = _keyframe_scene_ranges(Tv)
     else:
         scene_ranges = _fixed_scene_ranges(Tv, int(globals().get("SCENE_CHUNK_LATENT_FRAMES", 16)), overlap)
+    # HARD CAP: split any oversized chunk so Stage-2 activations fit the T4.
+    _max_len = int(globals().get("MAX_SCENE_LAT_FRAMES", 24))
+    _pre = len(scene_ranges)
+    scene_ranges = _cap_scene_ranges(scene_ranges, _max_len)
+    if len(scene_ranges) != _pre:
+        print(f"  🔒 Capped scene chunks to ≤{_max_len} latent frames: {_pre} → {len(scene_ranges)} chunks "
+              f"(prevents the big-chunk Stage-2 OOM).")
     n = len(scene_ranges)
     overlap = max(0, min(overlap, max(1, min(e - s for s, e in scene_ranges)) - 1))
     a_overlap = int(round(overlap * ratio))
