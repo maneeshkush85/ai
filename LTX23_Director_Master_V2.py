@@ -1947,17 +1947,25 @@ def execute_phase_b_batched(director_state: Dict[str, Any], model: Any, seed: in
             pack = torch.load(ck, map_location="cpu")
             v_out, a_out = pack["v"], pack.get("a")
         else:
-            print(f"\n  ── {tag}: latent frames {s}:{e} ({(e - s - 1) * 8 + 1} px) ──")
+            # CONTINUITY: extend each chunk's start LEFT by `overlap` frames so it
+            # re-samples the previous chunk's tail from the SAME shared latent with
+            # the SAME seed. _blend_append_T then crossfades those GENUINELY-identical
+            # frames → seamless character/scene continuity (no boundary ghosting) and
+            # continuous voice. (Old code blended adjacent DIFFERENT frames → drift.)
+            ws = max(0, s - overlap) if idx > 0 else s
+            print(f"\n  ── {tag}: latent frames {ws}:{e} "
+                  f"(sample {(e - ws - 1) * 8 + 1} px, {ws}:{s} = continuity context) ──")
             if reload_per_scene or model is None:
                 purge_deep(f"pre_{tag}")
                 model, _ = load_dit_and_loras(clip_obj=None)
             video_vae = gv(call_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
             ram_guard(globals().get("min_ram_guard_gb", 1.5), tag)
 
-            # Slice BOTH the shared video AND the shared audio latent → voice sync.
-            v_in = _slice_lat_T(director_state["video_latent"], s, e)
+            # Slice BOTH the shared video AND the shared audio latent (with left
+            # overlap) → shared timeline = consistent identity + synced voice.
+            v_in = _slice_lat_T(director_state["video_latent"], ws, e)
             a_in = (_slice_lat_T(director_state["audio_latent"],
-                                 int(round(s * ratio)), int(round(e * ratio)))
+                                 int(round(ws * ratio)), int(round(e * ratio)))
                     if full_a is not None else None)
 
             with torch.inference_mode():
@@ -2329,11 +2337,16 @@ def _config_signature(meta: Dict[str, Any]) -> str:
     from the last run, the old checkpoints are STALE (e.g. built at 1280x720) and
     must be cleared — otherwise resume would reuse old-resolution latents and the
     render-resolution speed fix would be silently ignored."""
-    return (f"render{meta.get('custom_width')}x{meta.get('custom_height')}"
+    # PIPELINE_REV: bump whenever the diffusion math changes so old final_latents
+    # are auto-regenerated (e.g. the overlap-continuity change → Phase B must rerun).
+    pipeline_rev = "v4-overlap-continuity"
+    return (f"rev={pipeline_rev}"
+            f"|render{meta.get('custom_width')}x{meta.get('custom_height')}"
             f"|gen{meta.get('generation_width')}x{meta.get('generation_height')}"
             f"|frames{meta.get('normalDurationFrames')}|fps{meta.get('frame_rate')}"
             f"|loras{len(globals().get('LORA_STACK', []))}"
-            f"|s1_{STAGE1['steps']}x{STAGE1['denoise']}|s2_{STAGE2['steps']}x{STAGE2['denoise']}")
+            f"|s1_{STAGE1['steps']}x{STAGE1['denoise']}|s2_{STAGE2['steps']}x{STAGE2['denoise']}"
+            f"|ov{globals().get('SCENE_OVERLAP_LATENT_FRAMES', 0)}")
 
 
 def guard_stale_cache(workdir: str, meta: Dict[str, Any]):
