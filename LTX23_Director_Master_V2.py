@@ -2071,43 +2071,104 @@ print("✅ Cell 13: Phase B (2-stage diffusion over the shared timeline) ready."
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CELL 14: PHASE C — OUT-OF-CORE TILED VAE DECODE (video) + AUDIO DECODE
+# CELL 14: PHASE C — CHUNKED STREAMING VAE DECODE (video) + AUDIO DECODE
 # ════════════════════════════════════════════════════════════════════════════
-def execute_phase_c(latent_file: str, workdir: str, resume: bool = True) -> Tuple[str, str]:
-    frames_file = os.path.join(workdir, "decoded_frames.pt")
+# RAM-safe: the old code decoded ALL 753 frames in one shot → a 3.85 GB float
+# tensor + a 1.9 GB half copy + a re-load in Phase D → OOM-kill on a 13 GB T4.
+# Now we decode the video latent in TEMPORAL CHUNKS and stream each chunk's frames
+# straight into the MP4 writer as uint8, so the full RGB video is never in RAM.
+DECODE_CHUNK_LAT_FRAMES = 12   # latent frames per decode chunk (~ (12-1)*8+1 px frames)
+DECODE_CHUNK_OVERLAP = 1       # latent-frame context each side (dropped) to avoid seams
+
+
+def _save_audio_wav(audio_dict: Any, wav_path: str, fallback_sr: int = 48000) -> bool:
+    """Write a ComfyUI AUDIO dict ({'waveform','sample_rate'}) to a WAV file."""
+    try:
+        if not isinstance(audio_dict, dict) or "waveform" not in audio_dict:
+            return False
+        wf = audio_dict["waveform"]
+        sr = int(audio_dict.get("sample_rate", fallback_sr))
+        if not isinstance(wf, torch.Tensor):
+            return False
+        w = wf.detach().cpu().float()
+        while w.dim() > 2:      # [B,C,S] → [C,S]
+            w = w[0]
+        if w.dim() == 1:
+            w = w.unsqueeze(0)
+        import torchaudio
+        torchaudio.save(wav_path, w, sr)
+        return os.path.exists(wav_path) and os.path.getsize(wav_path) > 100
+    except Exception as e:
+        print(f"  [notice] audio wav save failed ({e}).")
+        return False
+
+
+def execute_phase_c(latent_file: str, workdir: str, fps: int, crf: int,
+                    resume: bool = True) -> Tuple[str, str]:
+    raw_video = os.path.join(workdir, "raw_video_noaudio.mp4")
     audio_file = os.path.join(workdir, "decoded_audio.pt")
 
-    pack = torch.load(latent_file, map_location="cpu")
-    v_lat = pack["video"].float()
-    a_lat = pack["audio"]
+    need_video = not (resume and os.path.exists(raw_video) and os.path.getsize(raw_video) > 1024)
+    need_audio = not (resume and os.path.exists(audio_file))
 
-    if not (resume and os.path.exists(frames_file) and os.path.getsize(frames_file) > 1024):
-        print("\n" + "=" * 70 + "\n🎬 PHASE C1: TILED VIDEO VAE DECODE\n" + "=" * 70)
+    pack = torch.load(latent_file, map_location="cpu") if (need_video or need_audio) else None
+
+    # ── C1: chunked streaming VIDEO decode → MP4 (never holds the whole video) ──
+    if need_video:
+        print("\n" + "=" * 70 + "\n🎬 PHASE C1: CHUNKED STREAMING VIDEO DECODE\n" + "=" * 70)
         purge_deep("pre_video_decode")
+        import imageio
+        v_full = unwrap_latent({"samples": pack["video"]})["samples"]   # [B,C,T,H,W]
+        T = int(v_full.shape[2]) if (v_full is not None and v_full.dim() >= 3) else 1
+        chunk = max(2, int(DECODE_CHUNK_LAT_FRAMES))
+        ov = max(0, int(DECODE_CHUNK_OVERLAP))
+
+        writer = imageio.get_writer(
+            raw_video, fps=int(fps), codec="libx264", format="FFMPEG",
+            macro_block_size=None, ffmpeg_params=["-crf", str(int(crf)), "-pix_fmt", "yuv420p"])
+
+        written = 0
         with torch.inference_mode():
             video_vae = gv(call_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
-            frames = unwrap_tensor(tiled_decode_video({"samples": v_lat}, video_vae, tile_size=256))
-            frames = frames.detach().cpu().half()
-            torch.save(frames, frames_file + ".tmp")
-            os.replace(frames_file + ".tmp", frames_file)
-            print(f"  💾 Decoded frames {tuple(frames.shape)} → {frames_file}")
-            del video_vae, frames
+            start = 0
+            while start < T:
+                end = min(start + chunk, T)
+                ctx = max(0, start - ov) if start > 0 else 0
+                sub = v_full[:, :, ctx:end].float()
+                frames = unwrap_tensor(tiled_decode_video({"samples": sub}, video_vae, tile_size=256))
+                frames = frames.clamp(0, 1)
+                drop_px = (start - ctx) * 8 if start > 0 else 0   # discard context frames at the join
+                fslice = frames[drop_px:] if drop_px > 0 else frames
+                arr = (fslice.cpu().numpy() * 255.0).astype(np.uint8)
+                for i in range(arr.shape[0]):
+                    writer.append_data(arr[i])
+                written += arr.shape[0]
+                print(f"  🎨 Decoded latent {start}:{end} → +{arr.shape[0]} px frames (total {written})")
+                del sub, frames, fslice, arr
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                start = end
+            del video_vae, v_full
+        writer.close()
+        print(f"  💾 Streamed {written} frames → {raw_video}")
         purge_deep("post_video_decode")
     else:
-        print(f"  ⏭ [RESUME] Video frames cached: {frames_file}")
+        print(f"  ⏭ [RESUME] Raw video cached: {raw_video}")
 
-    # AUDIO decode via LTXVAudioVAEDecode → the synced vocals (voice-sync fix).
-    if not (resume and os.path.exists(audio_file) and os.path.getsize(audio_file) > 1024):
+    # ── C2: AUDIO decode via LTXVAudioVAEDecode → the synced vocals ──
+    if need_audio:
         print("\n" + "=" * 70 + "\n🎬 PHASE C2: AUDIO VAE DECODE (synced vocals)\n" + "=" * 70)
         purge_deep("pre_audio_decode")
         with torch.inference_mode():
+            a_lat = pack["audio"] if pack is not None else None
             if a_lat is not None:
                 audio_vae = gv(call_node("VAELoader", vae_name="LTX23_audio_vae_bf16.safetensors"), 0)
                 decoded_audio = gv(call_node("LTXVAudioVAEDecode",
                                              samples={"samples": a_lat.float()}, audio_vae=audio_vae), 0)
                 torch.save(decoded_audio, audio_file + ".tmp")
                 os.replace(audio_file + ".tmp", audio_file)
-                print(f"  💾 Decoded audio → {audio_file}")
+                print(f"  💾 Decoded synced audio → {audio_file}")
                 del audio_vae, decoded_audio
             else:
                 torch.save(None, audio_file)
@@ -2116,71 +2177,66 @@ def execute_phase_c(latent_file: str, workdir: str, resume: bool = True) -> Tupl
     else:
         print(f"  ⏭ [RESUME] Audio cached: {audio_file}")
 
-    del v_lat, a_lat, pack
+    del pack
     gc.collect()
     malloc_trim_os()
-    return frames_file, audio_file
+    return raw_video, audio_file
 
 
-print("✅ Cell 14: Phase C (video + audio VAE decode) ready.")
+print("✅ Cell 14: Phase C (chunked streaming video decode + audio decode) ready.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# CELL 15: PHASE D — VHS_VideoCombine FINAL ASSEMBLY
+# CELL 15: PHASE D — FINAL AUDIO MUX  (video already streamed to MP4 in Phase C)
 # ════════════════════════════════════════════════════════════════════════════
-def execute_phase_d(frames_file: str, audio_file: str, fps: int, crf: int,
+def execute_phase_d(raw_video: str, audio_file: str, fps: int, crf: int,
                     outdir: str, song_path: str, trim_start_frames: float) -> str:
     os.makedirs(outdir, exist_ok=True)
     final_path = os.path.join(outdir, "LTX23_Director_Master_30s.mp4")
 
-    print("\n" + "=" * 70 + "\n🎬 PHASE D: VHS_VideoCombine FINAL ASSEMBLY\n" + "=" * 70)
-    purge_deep("pre_vhs")
+    print("\n" + "=" * 70 + "\n🎬 PHASE D: FINAL AUDIO MUX\n" + "=" * 70)
+    purge_deep("pre_mux")
 
-    frames = torch.load(frames_file, map_location="cpu").float()
+    if not (os.path.exists(raw_video) and os.path.getsize(raw_video) > 1024):
+        raise RuntimeError(f"Raw video missing: {raw_video}")
+
     audio_dict = torch.load(audio_file, map_location="cpu") if os.path.exists(audio_file) else None
-    print(f"  🎬 Combining {frames.shape[0]} frames @ {fps} fps with synced audio...")
 
-    combined = False
-    try:
-        res = call_node("VHS_VideoCombine",
-                        images=frames, audio=audio_dict, frame_rate=float(fps),
-                        loop_count=0, filename_prefix=VHS_SETTINGS["filename_prefix"],
-                        format=VHS_SETTINGS["format"], pix_fmt=VHS_SETTINGS["pix_fmt"],
-                        crf=int(crf), save_metadata=False, trim_to_audio=False,
-                        pingpong=False, save_output=True)
-        info = gv(res, 0)
-        if isinstance(info, dict) and "ui" in info and "gifs" in info["ui"]:
-            gen = info["ui"]["gifs"][0].get("fullpath", "")
-            if gen and os.path.exists(gen):
-                shutil.copyfile(gen, final_path)
-                combined = True
-    except Exception as e:
-        print(f"  [notice] VHS node fallback: {e}")
+    # Preference 1: the MODEL-generated synced vocals (from LTXVAudioVAEDecode).
+    muxed = False
+    wav_path = os.path.join(outdir, "_synced_audio.wav")
+    if audio_dict is not None and _save_audio_wav(audio_dict, wav_path):
+        print("  🎵 Muxing model-generated synced vocals...")
+        cmd = (f'ffmpeg -y -i "{raw_video}" -i "{wav_path}" -map 0:v:0 -map 1:a:0 '
+               f'-c:v copy -c:a aac -b:a 320k -shortest "{final_path}"')
+        if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_path):
+            muxed = True
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
 
-    if not combined or not os.path.exists(final_path):
-        import imageio
-        raw = os.path.join(outdir, "_raw_video.mp4")
-        arr = (frames.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-        imageio.mimwrite(raw, arr, fps=fps, quality=9)
-        if song_path and os.path.exists(song_path):
-            trim_sec = float(trim_start_frames) / fps
-            dur_sec = frames.shape[0] / fps
-            cmd = (f'ffmpeg -y -i "{raw}" -ss {trim_sec} -t {dur_sec} -i "{song_path}" '
-                   f'-map 0:v:0 -map 1:a:0 -c:v libx264 -crf {crf} -pix_fmt yuv420p '
-                   f'-c:a aac -b:a 320k -shortest "{final_path}"')
-            run_cmd(cmd, silent=False)
-            if os.path.exists(raw):
-                os.remove(raw)
-        else:
-            shutil.move(raw, final_path)
+    # Preference 2: mux the original song, trimmed to the timeline's trimStart.
+    if not muxed and song_path and os.path.exists(song_path):
+        print("  🎵 Muxing original song track (trimmed to timeline)...")
+        trim_sec = float(trim_start_frames) / float(fps)
+        cmd = (f'ffmpeg -y -i "{raw_video}" -ss {trim_sec} -i "{song_path}" '
+               f'-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 320k -shortest "{final_path}"')
+        if run_cmd(cmd, silent=False) == 0 and os.path.exists(final_path):
+            muxed = True
 
-    del frames, audio_dict
-    purge_deep("post_vhs")
+    # Preference 3: no audio — just publish the video.
+    if not muxed:
+        shutil.copyfile(raw_video, final_path)
+        print("  ⚠️ No audio muxed; published video-only.")
+
+    del audio_dict
+    purge_deep("post_mux")
     print(f"  🎉 Master MP4: {final_path}")
     return final_path
 
 
-print("✅ Cell 15: Phase D (VHS assembly) ready.")
+print("✅ Cell 15: Phase D (final audio mux) ready.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2293,10 +2349,12 @@ def run_ltx23_director_master(global_prompt, negative_prompt, meta, segments,
         del director_state, patched_model
         purge_deep("post_phase_b_master")
 
-    frames_file, audio_file = execute_phase_c(latent_file, workdir=workdir, resume=resume)
+    raw_video, audio_file = execute_phase_c(
+        latent_file, workdir=workdir,
+        fps=int(active_meta["frame_rate"]), crf=crf, resume=resume)
 
     final_video = execute_phase_d(
-        frames_file, audio_file,
+        raw_video, audio_file,
         fps=int(active_meta["frame_rate"]), crf=crf, outdir=outdir,
         song_path=SONG_PATH if use_song_audio else "",
         trim_start_frames=active_meta["audio_trim_start_frames"])
