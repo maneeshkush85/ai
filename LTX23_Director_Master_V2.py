@@ -469,9 +469,10 @@ divisible_by      = 32     # @param {type:"raw"}
 keyframe_guide_strength = 1.0  # @param {type:"slider", min:0.0, max:1.0, step:0.05}
 # @markdown ### ⚡ SPEED KNOB — Stage-1 base render resolution
 # @markdown `two_stage_base_render` = LTXDirector renders SMALL (generation//2, e.g. 416x240) so the
-# @markdown 8-step Stage 1 is ~7x FASTER on a T4; LTXVLatentUpsampler then 2x-upscales to the target.
-# @markdown Set False ONLY on an L4/A100 to render Stage 1 at the full 1280x720 canvas (very slow on a T4).
-two_stage_base_render = True   # @param {type:"boolean"}
+# @markdown • False (FAITHFUL, needs L4/A100 ~24GB): base = custom//2 (640x360) → 2x → 1280x720 — best face/eye/lip detail.
+# @markdown • True (T4-safe): base = generation//2 (416x240) → 2x → 832x480 — much faster/lighter, lower detail.
+# @markdown (auto_safe_on_t4 below will auto-force True if your GPU is a small T4.)
+two_stage_base_render = False  # @param {type:"boolean"}
 
 # @markdown ## 🎛️ Director 2.0 4-LoRA Stack  (exact JSON strengths; all ON like the workflow)
 use_lora_1 = True      # @param {type:"boolean"}
@@ -506,11 +507,20 @@ essential_loras_only = False  # @param {type:"boolean"}   # False = faithful 4-L
 # @markdown working Master_V2 (ComfyUI offloads a little model to CPU, leaving headroom for LoRA patches).
 vram_shield_mb       = 1200   # @param {type:"raw"}
 min_ram_guard_gb     = 1.5    # @param {type:"slider", min:1.0, max:6.0, step:0.5}
-# @markdown ### 🎬 Batch-by-batch scene generation (fits the T4; shares ONE timeline + ONE audio latent)
-batch_scene_mode          = True   # @param {type:"boolean"}
+# @markdown ### 🎬 Diffusion mode
+# @markdown `batch_scene_mode` — False (FAITHFUL, like the JSON): diffuse the WHOLE 756-frame timeline in
+# @markdown ONE continuous pass → no scene-boundary ghosting/distortion, no audio-slice desync. Needs a
+# @markdown big GPU (L4/A100). True splits the timeline into scene chunks (fits a T4) but can show mild
+# @markdown seams at scene joins. auto_safe_on_t4 will auto-force True on a small T4.
+batch_scene_mode          = False  # @param {type:"boolean"}
+# @markdown `auto_safe_on_t4` — if the GPU has < ~20 GB VRAM (i.e. a T4), auto-switch to the T4-safe combo
+# @markdown (batch_scene_mode=True + two_stage_base_render=True) so it doesn't OOM. Set False to FORCE the
+# @markdown faithful single-pass full-res path on a T4 (will very likely crash — only if you know why).
+auto_safe_on_t4           = True   # @param {type:"boolean"}
 scene_mode                = "keyframe"  # @param ["keyframe", "fixed"]
 scene_chunk_seconds       = 4.0    # @param {type:"slider", min:1.0, max:10.0, step:0.5}
-scene_overlap_frames      = 8      # @param {type:"slider", min:0, max:24, step:1}
+# @markdown Bigger overlap = smoother scene joins in batch mode (crossfaded in latent space).
+scene_overlap_frames      = 16     # @param {type:"slider", min:0, max:32, step:1}
 # @markdown `reload_dit_per_scene` — False (RECOMMENDED on free T4 with 0 swap): load DiT + dequant the
 # @markdown 4 LoRAs ONCE, reuse for every scene → avoids the per-scene GGUF+LoRA dequant RAM spike that
 # @markdown OOM-kills a 13 GB Colab runtime ("session crashed"). True reloads fresh per scene (cleaner
@@ -521,6 +531,27 @@ reload_dit_per_scene      = False  # @param {type:"boolean"}
 output_crf         = 8     # @param {type:"slider", min:0, max:30, step:1}
 base_seed          = 0     # @param {type:"integer"}
 resume_checkpoints = True  # @param {type:"boolean"}
+
+# ── VRAM auto-detect: protect small T4s from the faithful single-pass full-res OOM ──
+try:
+    _gpu_total_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9) if torch.cuda.is_available() else 0.0
+    _gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+except Exception:
+    _gpu_total_gb, _gpu_name = 0.0, "unknown"
+
+FULL_QUALITY_HW = _gpu_total_gb >= 20.0   # L4 (24GB) / A100 (40GB) etc.
+print(f"  🖥️  GPU: {_gpu_name} ({_gpu_total_gb:.1f} GB VRAM) → "
+      f"{'FULL-QUALITY capable' if FULL_QUALITY_HW else 'small GPU (T4-class)'}")
+
+if auto_safe_on_t4 and not FULL_QUALITY_HW and (not batch_scene_mode or not two_stage_base_render):
+    print("  ⚠️  AUTO-SAFE: this GPU can't run the faithful single-pass full-res path without OOM.")
+    print("      → Forcing T4-safe combo: batch_scene_mode=True + two_stage_base_render=True.")
+    print("      For the FULL faithful 1280x720 single-pass quality, use an L4/A100 runtime")
+    print("      (Runtime ▸ Change runtime type), or set auto_safe_on_t4=False to force it here.")
+    batch_scene_mode = True
+    two_stage_base_render = True
+elif FULL_QUALITY_HW and not batch_scene_mode and not two_stage_base_render:
+    print("  ✅ FAITHFUL MODE: single continuous 756-frame pass, base custom//2 → 2x → full canvas.")
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Derived configuration (built from settings above — do not edit below).
@@ -575,16 +606,19 @@ def _snap_div(n: int, d: int) -> int:
     return max(d, int(round(n / d)) * d)
 
 
-# ⚡ SPEED FIX: LTXDirector renders latents at custom_width/custom_height. The old
-# 1280x720 canvas made the 8-step Stage 1 sample at ~720p (~7x slower on a T4).
-# With two_stage_base_render=True we render at the Stage-1 BASE (generation//2,
-# snapped to divisible_by), then LTXVLatentUpsampler 2x-upscales to the target.
+# LTXDirector renders latents at custom_width/custom_height; the LTXVLatentUpsampler
+# then 2x-upscales. So Stage-1 base = (final target) / 2.
+#   • two_stage_base_render=True  → base = generation//2 (416x240) → 2x → 832x480  (T4-fast, lower detail)
+#   • two_stage_base_render=False → base = CUSTOM//2 (640x360)     → 2x → 1280x720 (FAITHFUL, needs L4/A100)
+# The old bug rendered the base at the FULL 1280x720, which the 2x upscaler would
+# blow up to 2560x1440. Rendering the base at custom//2 fixes that.
 _base_w = _snap_div(int(generation_width) // 2, divisible_by)
 _base_h = _snap_div(int(generation_height) // 2, divisible_by)
 if two_stage_base_render:
     _director_render_w, _director_render_h = _base_w, _base_h
 else:
-    _director_render_w, _director_render_h = int(custom_width), int(custom_height)
+    _director_render_w = _snap_div(int(custom_width) // 2, divisible_by)
+    _director_render_h = _snap_div(int(custom_height) // 2, divisible_by)
 
 TIMELINE_METADATA = {
     "frame_rate": float(fps),
