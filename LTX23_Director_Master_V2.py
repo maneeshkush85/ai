@@ -157,6 +157,9 @@ run_cmd("pip install -q torchsde einops diffusers accelerate psutil")
 run_cmd("pip install -q av spandrel albumentations onnx opencv-python onnxruntime nest_asyncio imageio aiohttp scipy")
 run_cmd("pip install -q 'kornia==0.7.3'")
 run_cmd("apt-get -y install -qq aria2 ffmpeg")
+# SageAttention → 1.5-2x faster attention during sampling (PatchSageAttentionKJ needs it).
+# Optional; the pipeline still runs if this wheel is unavailable for the T4's CUDA.
+run_cmd("pip install -q sageattention || true")
 
 print("✅ Cell 2: Dependencies installed.")
 
@@ -471,6 +474,11 @@ custom_height     = 720    # @param [512, 576, 720] {type:"raw"}
 img_compression   = 18     # @param {type:"slider", min:0, max:60, step:1}
 divisible_by      = 32     # @param {type:"raw"}
 keyframe_guide_strength = 1.0  # @param {type:"slider", min:0.0, max:1.0, step:0.05}
+# @markdown ### ⚡ SPEED KNOB — Stage-1 base render resolution
+# @markdown `two_stage_base_render` = LTXDirector renders SMALL (generation//2, e.g. 416x240) so the
+# @markdown 8-step Stage 1 is ~7x FASTER on a T4; LTXVLatentUpsampler then 2x-upscales to the target.
+# @markdown Set False ONLY on an L4/A100 to render Stage 1 at the full 1280x720 canvas (very slow on a T4).
+two_stage_base_render = True   # @param {type:"boolean"}
 
 # @markdown ## 🎛️ Director 2.0 4-LoRA Stack  (exact JSON strengths; all ON like the workflow)
 use_lora_1 = True      # @param {type:"boolean"}
@@ -507,7 +515,9 @@ batch_scene_mode          = True   # @param {type:"boolean"}
 scene_mode                = "keyframe"  # @param ["keyframe", "fixed"]
 scene_chunk_seconds       = 4.0    # @param {type:"slider", min:1.0, max:10.0, step:0.5}
 scene_overlap_frames      = 8      # @param {type:"slider", min:0, max:24, step:1}
-reload_dit_per_scene      = True   # @param {type:"boolean"}
+# @markdown `reload_dit_per_scene` — True = safest memory (reload the 22B DiT before each scene, adds ~1 min/scene).
+# @markdown With `two_stage_base_render=True` the base is small, so False (load once, reuse) is ~4 min faster & usually fits.
+reload_dit_per_scene      = False  # @param {type:"boolean"}
 
 # @markdown ## 💾 Output & Run
 output_crf         = 8     # @param {type:"slider", min:0, max:30, step:1}
@@ -561,18 +571,38 @@ ORIGINAL_AUDIO_SEGMENTS = [{
 }]
 ORIGINAL_MOTION_SEGMENTS: List[Dict[str, Any]] = []   # motion track empty in the JSON
 
+
+def _snap_div(n: int, d: int) -> int:
+    d = max(1, int(d))
+    return max(d, int(round(n / d)) * d)
+
+
+# ⚡ SPEED FIX: LTXDirector renders latents at custom_width/custom_height. The old
+# 1280x720 canvas made the 8-step Stage 1 sample at ~720p (~7x slower on a T4).
+# With two_stage_base_render=True we render at the Stage-1 BASE (generation//2,
+# snapped to divisible_by), then LTXVLatentUpsampler 2x-upscales to the target.
+_base_w = _snap_div(int(generation_width) // 2, divisible_by)
+_base_h = _snap_div(int(generation_height) // 2, divisible_by)
+if two_stage_base_render:
+    _director_render_w, _director_render_h = _base_w, _base_h
+else:
+    _director_render_w, _director_render_h = int(custom_width), int(custom_height)
+
 TIMELINE_METADATA = {
     "frame_rate": float(fps),
     "duration_seconds": _duration_seconds,
     "normalDurationFrames": _total_frames,
     "start_frame": 0,
     "end_frame": _total_frames,
-    "custom_width": int(custom_width),
-    "custom_height": int(custom_height),
+    # custom_width/height is the resolution LTXDirector actually RENDERS at.
+    "custom_width": int(_director_render_w),
+    "custom_height": int(_director_render_h),
+    "authoring_width": int(custom_width),      # original 1280x720 authoring canvas (note only)
+    "authoring_height": int(custom_height),
     "generation_width": int(generation_width),
     "generation_height": int(generation_height),
-    "base_stage1_width": int(generation_width) // 2,
-    "base_stage1_height": int(generation_height) // 2,
+    "base_stage1_width": _base_w,
+    "base_stage1_height": _base_h,
     "mainTrackEnabled": True,
     "audioTrackEnabled": bool(use_song_audio),
     "motionTrackEnabled": True,
@@ -623,9 +653,14 @@ OUTPUT_CRF = int(output_crf)
 RESUME_CHECKPOINTS = bool(resume_checkpoints)
 USE_SONG_AUDIO = bool(use_song_audio)
 
-print(f"✅ Cell 6: Master Timeline notes loaded → {generation_width}x{generation_height} @ {fps}fps · "
+print(f"✅ Cell 6: Master Timeline notes loaded → Stage1 base {_director_render_w}x{_director_render_h} "
+      f"→ 2x → {generation_width}x{generation_height} @ {fps}fps · "
       f"{_duration_seconds:.1f}s ({_total_frames} frames) · 5 keyframes · 1 audio track · "
-      f"{len(LORA_STACK)} LoRA(s) · VRAM_MODE={VRAM_MODE}")
+      f"{len(LORA_STACK)} LoRA(s) · VRAM_MODE={VRAM_MODE} · "
+      f"two_stage_base_render={two_stage_base_render}")
+if two_stage_base_render:
+    print(f"  ⚡ Stage 1 will sample at {_director_render_w}x{_director_render_h} (fast) instead of "
+          f"{custom_width}x{custom_height} — expect ~{(custom_width*custom_height)/(_director_render_w*_director_render_h):.1f}x faster iterations.")
 
 
 
