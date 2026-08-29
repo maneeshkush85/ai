@@ -117,11 +117,43 @@ if not os.path.exists("/content/swapfile") or os.path.getsize("/content/swapfile
     run_cmd("sysctl vm.swappiness=100 || true")
     run_cmd("sysctl vm.vfs_cache_pressure=500 || true")
 
+# Verify swap actually turned on. Colab often silently refuses swapon on /content
+# (overlay/gcsfuse). If so, retry on the local root disk — swap is the RAM cushion
+# that prevents the "session crashed for an unknown reason" OOM-kill on a 13 GB T4.
+def _ensure_swap_active(min_gb: float = 4.0) -> float:
+    try:
+        import psutil
+        if psutil.swap_memory().total / 1e9 >= min_gb:
+            return psutil.swap_memory().total / 1e9
+    except Exception:
+        pass
+    for path, gb in [("/swapfile", 12), ("/content/swapfile", 12), ("/var/swapfile", 8)]:
+        try:
+            run_cmd(f"swapoff {path} 2>/dev/null || true")
+            run_cmd(f"rm -f {path}")
+            if run_cmd(f"fallocate -l {gb}G {path} || dd if=/dev/zero of={path} bs=1M count={gb*1024} status=none") != 0:
+                continue
+            run_cmd(f"chmod 600 {path}")
+            run_cmd(f"mkswap {path}")
+            if run_cmd(f"swapon {path}") == 0:
+                break
+        except Exception:
+            continue
+    try:
+        import psutil
+        return psutil.swap_memory().total / 1e9
+    except Exception:
+        return 0.0
+
+_swap_gb = _ensure_swap_active()
 try:
     import psutil
-    _sw = psutil.swap_memory()
     _vm = psutil.virtual_memory()
-    print(f"  📊 Memory: Host RAM {_vm.available/1e9:.2f} GB free / {_vm.total/1e9:.2f} GB | Swap {_sw.total/1e9:.2f} GB")
+    print(f"  📊 Memory: Host RAM {_vm.available/1e9:.2f} GB free / {_vm.total/1e9:.2f} GB | Swap {_swap_gb:.2f} GB")
+    if _swap_gb < 2.0:
+        print("  ⚠️  NO SWAP available (Colab blocked it). Host RAM has NO cushion — if you see "
+              "'session crashed', keep reload_dit_per_scene=False, essential_loras_only=True, "
+              "and/or lower render_seconds (Cell 6).")
 except Exception:
     pass
 
@@ -518,10 +550,11 @@ batch_scene_mode          = True   # @param {type:"boolean"}
 scene_mode                = "keyframe"  # @param ["keyframe", "fixed"]
 scene_chunk_seconds       = 4.0    # @param {type:"slider", min:1.0, max:10.0, step:0.5}
 scene_overlap_frames      = 8      # @param {type:"slider", min:0, max:24, step:1}
-# @markdown `reload_dit_per_scene` — True = reload the 22B DiT fresh before each scene (old Master_V2's
-# @markdown winning pattern: resets VRAM every scene so nothing accumulates → no per-scene LoRA OOM).
-# @markdown False loads once (faster) but VRAM creeps up across scenes on a T4. Keep True on a free T4.
-reload_dit_per_scene      = True   # @param {type:"boolean"}
+# @markdown `reload_dit_per_scene` — False (RECOMMENDED on free T4 with 0 swap): load DiT + dequant the
+# @markdown 4 LoRAs ONCE, reuse for every scene → avoids the per-scene GGUF+LoRA dequant RAM spike that
+# @markdown OOM-kills a 13 GB Colab runtime ("session crashed"). True reloads fresh per scene (cleaner
+# @markdown VRAM but a big host-RAM spike each scene) — only use it if you actually hit a VRAM OOM.
+reload_dit_per_scene      = False  # @param {type:"boolean"}
 
 # @markdown ## 💾 Output & Run
 output_crf         = 8     # @param {type:"slider", min:0, max:30, step:1}
