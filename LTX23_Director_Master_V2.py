@@ -2103,7 +2103,7 @@ print("✅ Cell 13: Phase B (2-stage diffusion over the shared timeline) ready."
 # tensor + a 1.9 GB half copy + a re-load in Phase D → OOM-kill on a 13 GB T4.
 # Now we decode the video latent in TEMPORAL CHUNKS and stream each chunk's frames
 # straight into the MP4 writer as uint8, so the full RGB video is never in RAM.
-DECODE_CHUNK_LAT_FRAMES = 12   # latent frames per decode chunk (~ (12-1)*8+1 px frames)
+DECODE_CHUNK_LAT_FRAMES = 8    # latent frames per decode chunk (~57 px frames) — small = RAM-safe on T4
 DECODE_CHUNK_OVERLAP = 1       # latent-frame context each side (dropped) to avoid seams
 
 
@@ -2133,52 +2133,79 @@ def execute_phase_c(latent_file: str, workdir: str, fps: int, crf: int,
                     resume: bool = True) -> Tuple[str, str]:
     raw_video = os.path.join(workdir, "raw_video_noaudio.mp4")
     audio_file = os.path.join(workdir, "decoded_audio.pt")
+    chunk_dir = os.path.join(workdir, "dec_chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
 
     need_video = not (resume and os.path.exists(raw_video) and os.path.getsize(raw_video) > 1024)
     need_audio = not (resume and os.path.exists(audio_file))
 
     pack = torch.load(latent_file, map_location="cpu") if (need_video or need_audio) else None
 
-    # ── C1: chunked streaming VIDEO decode → MP4 (never holds the whole video) ──
+    # ── C1: PER-CHUNK RESUMABLE VIDEO decode → one small MP4 per chunk → concat ──
+    # Each chunk is decoded to its own vchunk_NNN.mp4. A crash only loses the
+    # in-progress chunk; re-running SKIPS finished chunks and continues. The full
+    # RGB video is never held in RAM (peak ≈ one chunk).
     if need_video:
-        print("\n" + "=" * 70 + "\n🎬 PHASE C1: CHUNKED STREAMING VIDEO DECODE\n" + "=" * 70)
+        print("\n" + "=" * 70 + "\n🎬 PHASE C1: PER-CHUNK RESUMABLE VIDEO DECODE\n" + "=" * 70)
         purge_deep("pre_video_decode")
         import imageio
         v_full = unwrap_latent({"samples": pack["video"]})["samples"]   # [B,C,T,H,W]
         T = int(v_full.shape[2]) if (v_full is not None and v_full.dim() >= 3) else 1
-        chunk = max(2, int(DECODE_CHUNK_LAT_FRAMES))
-        ov = max(0, int(DECODE_CHUNK_OVERLAP))
+        chunk = max(2, int(globals().get("DECODE_CHUNK_LAT_FRAMES", 8)))
+        ov = max(0, int(globals().get("DECODE_CHUNK_OVERLAP", 1)))
 
-        writer = imageio.get_writer(
-            raw_video, fps=int(fps), codec="libx264", format="FFMPEG",
-            macro_block_size=None, ffmpeg_params=["-crf", str(int(crf)), "-pix_fmt", "yuv420p"])
+        # Deterministic chunk list (same every run → resume maps correctly).
+        chunk_ranges, start = [], 0
+        while start < T:
+            chunk_ranges.append((start, min(start + chunk, T)))
+            start += chunk
 
-        written = 0
-        with torch.inference_mode():
-            video_vae = gv(call_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
-            start = 0
-            while start < T:
-                end = min(start + chunk, T)
-                ctx = max(0, start - ov) if start > 0 else 0
-                sub = v_full[:, :, ctx:end].float()
-                frames = unwrap_tensor(tiled_decode_video({"samples": sub}, video_vae, tile_size=256))
-                frames = frames.clamp(0, 1)
-                drop_px = (start - ctx) * 8 if start > 0 else 0   # discard context frames at the join
+        video_vae = None
+        for ci, (s, e) in enumerate(chunk_ranges):
+            seg_mp4 = os.path.join(chunk_dir, f"vchunk_{ci:03d}.mp4")
+            if resume and os.path.exists(seg_mp4) and os.path.getsize(seg_mp4) > 512:
+                print(f"  ⏭ [RESUME] chunk {ci+1}/{len(chunk_ranges)} already decoded.")
+                continue
+            if video_vae is None:
+                video_vae = gv(call_node("VAELoader", vae_name="LTX23_video_vae_bf16.safetensors"), 0)
+            with torch.inference_mode():
+                ctx = max(0, s - ov) if s > 0 else 0
+                sub = v_full[:, :, ctx:e].float()
+                frames = unwrap_tensor(tiled_decode_video({"samples": sub}, video_vae, tile_size=256)).clamp(0, 1)
+                drop_px = (s - ctx) * 8 if s > 0 else 0
                 fslice = frames[drop_px:] if drop_px > 0 else frames
                 arr = (fslice.cpu().numpy() * 255.0).astype(np.uint8)
-                for i in range(arr.shape[0]):
-                    writer.append_data(arr[i])
-                written += arr.shape[0]
-                print(f"  🎨 Decoded latent {start}:{end} → +{arr.shape[0]} px frames (total {written})")
-                del sub, frames, fslice, arr
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                start = end
-            del video_vae, v_full
-        writer.close()
-        print(f"  💾 Streamed {written} frames → {raw_video}")
+            tmp_seg = seg_mp4 + ".tmp.mp4"
+            w = imageio.get_writer(tmp_seg, fps=int(fps), codec="libx264", format="FFMPEG",
+                                   macro_block_size=None,
+                                   ffmpeg_params=["-crf", str(int(crf)), "-pix_fmt", "yuv420p"])
+            for i in range(arr.shape[0]):
+                w.append_data(arr[i])
+            w.close()
+            os.replace(tmp_seg, seg_mp4)
+            print(f"  🎨 chunk {ci+1}/{len(chunk_ranges)} (latent {s}:{e}) → {arr.shape[0]} px frames → {os.path.basename(seg_mp4)}")
+            del sub, frames, fslice, arr
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            malloc_trim_os()
+        if video_vae is not None:
+            del video_vae
+        del v_full
         purge_deep("post_video_decode")
+
+        # Concatenate all chunk MP4s (same codec/params → lossless -c copy concat).
+        seglist = sorted(glob.glob(os.path.join(chunk_dir, "vchunk_*.mp4")))
+        listfile = os.path.join(chunk_dir, "concat_list.txt")
+        with open(listfile, "w") as fh:
+            for sp in seglist:
+                fh.write(f"file '{sp}'\n")
+        run_cmd(f'ffmpeg -y -f concat -safe 0 -i "{listfile}" -c copy "{raw_video}"', silent=False)
+        if not (os.path.exists(raw_video) and os.path.getsize(raw_video) > 1024):
+            # Fallback: re-encode concat if stream-copy failed.
+            run_cmd(f'ffmpeg -y -f concat -safe 0 -i "{listfile}" -c:v libx264 -crf {int(crf)} '
+                    f'-pix_fmt yuv420p "{raw_video}"', silent=False)
+        print(f"  💾 Concatenated {len(seglist)} chunks → {raw_video}")
     else:
         print(f"  ⏭ [RESUME] Raw video cached: {raw_video}")
 
