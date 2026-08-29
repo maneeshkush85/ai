@@ -1934,7 +1934,7 @@ def execute_phase_b_batched(director_state: Dict[str, Any], model: Any, seed: in
                     model, video_vae, STAGE1["guide_strength"], base_pos, base_neg,
                     v_in, a_in, guide_data, motion_guide,
                     STAGE1["scheduler"], STAGE1["steps"], STAGE1["denoise"], STAGE1["cfg"],
-                    seed + idx, f"{tag} · Stage 1")
+                    seed, f"{tag} · Stage 1")   # SAME seed every chunk → consistent identity across scenes
                 medium_clear(f"{tag}_post_s1")
 
                 up_model = gv(call_node("LatentUpscaleModelLoader",
@@ -1949,7 +1949,7 @@ def execute_phase_b_batched(director_state: Dict[str, Any], model: Any, seed: in
                     model, video_vae, STAGE2["guide_strength"], s1p, s1n,
                     v_ups, s1a, guide_data, motion_guide,
                     STAGE2["scheduler"], STAGE2["steps"], STAGE2["denoise"], STAGE2["cfg"],
-                    seed + idx, f"{tag} · Stage 2")
+                    seed, f"{tag} · Stage 2")   # SAME seed every chunk → consistent identity across scenes
                 medium_clear(f"{tag}_post_s2")
 
                 v_out = unwrap_tensor(s2v).detach().cpu().half()
