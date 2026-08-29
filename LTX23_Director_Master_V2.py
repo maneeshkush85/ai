@@ -507,17 +507,21 @@ audio_trim_start_frames = 446.9222739141953  # @param {type:"raw"}
 
 # @markdown ## 🧠 Memory / Performance  (free-tier T4)
 VRAM_MODE = "auto"            # @param ["auto", "normalvram", "lowvram", "novram", "highvram"]
-essential_loras_only = False  # @param {type:"boolean"}   # False = faithful 4-LoRA; True = distilled-only (saves RAM)
-vram_shield_mb       = 256    # @param {type:"raw"}
+essential_loras_only = False  # @param {type:"boolean"}   # False = faithful 4-LoRA; True = distilled-only (saves VRAM/RAM)
+# @markdown `vram_shield_mb` — RESERVE this much VRAM so on-the-fly GGUF LoRA deltas (adaln etc.) have
+# @markdown room to compute. 256 was too small → "lora ... CUDA out of memory". 1200 matches the old
+# @markdown working Master_V2 (ComfyUI offloads a little model to CPU, leaving headroom for LoRA patches).
+vram_shield_mb       = 1200   # @param {type:"raw"}
 min_ram_guard_gb     = 1.5    # @param {type:"slider", min:1.0, max:6.0, step:0.5}
 # @markdown ### 🎬 Batch-by-batch scene generation (fits the T4; shares ONE timeline + ONE audio latent)
 batch_scene_mode          = True   # @param {type:"boolean"}
 scene_mode                = "keyframe"  # @param ["keyframe", "fixed"]
 scene_chunk_seconds       = 4.0    # @param {type:"slider", min:1.0, max:10.0, step:0.5}
 scene_overlap_frames      = 8      # @param {type:"slider", min:0, max:24, step:1}
-# @markdown `reload_dit_per_scene` — True = safest memory (reload the 22B DiT before each scene, adds ~1 min/scene).
-# @markdown With `two_stage_base_render=True` the base is small, so False (load once, reuse) is ~4 min faster & usually fits.
-reload_dit_per_scene      = False  # @param {type:"boolean"}
+# @markdown `reload_dit_per_scene` — True = reload the 22B DiT fresh before each scene (old Master_V2's
+# @markdown winning pattern: resets VRAM every scene so nothing accumulates → no per-scene LoRA OOM).
+# @markdown False loads once (faster) but VRAM creeps up across scenes on a T4. Keep True on a free T4.
+reload_dit_per_scene      = True   # @param {type:"boolean"}
 
 # @markdown ## 💾 Output & Run
 output_crf         = 8     # @param {type:"slider", min:0, max:30, step:1}
@@ -777,8 +781,10 @@ def get_ram_free_gb() -> float:
 
 
 def patch_comfy_memory_manager():
-    """Fix free_memory return type + reserve a small VRAM shield; force the text
-    encoder onto CUDA so the 12B Gemma dequantizes into VRAM, not host RAM."""
+    """Fix free_memory return type + reserve a VRAM shield (VRAM_SHIELD_MB) so
+    ComfyUI keeps headroom for on-the-fly GGUF LoRA delta computation (otherwise
+    'lora ... CUDA out of memory'); force the text encoder onto CUDA so the 12B
+    Gemma dequantizes into VRAM, not host RAM."""
     try:
         import comfy.model_management as mm
         if not getattr(mm, "_ltx_patched", False):
