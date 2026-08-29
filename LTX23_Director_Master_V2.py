@@ -73,7 +73,7 @@ On an L4/A100 set BATCH_SCENE_MODE = False for the true single-pass diffusion.
 """
 
 # ════════════════════════════════════════════════════════════════════════════
-# CELL 1: ENVIRONMENT SETUP, 16 GB SWAP & MEMORY PROTECTION
+# CELL 1: ENVIRONMENT SETUP & MEMORY PROTECTION  (no swap — Colab blocks it)
 # ════════════════════════════════════════════════════════════════════════════
 import subprocess
 import sys
@@ -105,55 +105,16 @@ def run_cmd(cmd: str, silent: bool = True) -> int:
     return subprocess.run(cmd, shell=True).returncode
 
 
-# 16 GB high-speed swap partition — critical host-RAM head-room.
-if not os.path.exists("/content/swapfile") or os.path.getsize("/content/swapfile") < (8 * 1024 * 1024 * 1024):
-    print("⚙️ [1/3] Setting up Contiguous 16 GB Swap Partition...")
-    run_cmd("swapoff /content/swapfile || true")
-    run_cmd("rm -f /content/swapfile")
-    run_cmd("dd if=/dev/zero of=/content/swapfile bs=1M count=16384 status=none || fallocate -l 16G /content/swapfile")
-    run_cmd("chmod 600 /content/swapfile")
-    run_cmd("mkswap /content/swapfile")
-    run_cmd("swapon /content/swapfile || true")
-    run_cmd("sysctl vm.swappiness=100 || true")
-    run_cmd("sysctl vm.vfs_cache_pressure=500 || true")
-
-# Verify swap actually turned on. Colab often silently refuses swapon on /content
-# (overlay/gcsfuse). If so, retry on the local root disk — swap is the RAM cushion
-# that prevents the "session crashed for an unknown reason" OOM-kill on a 13 GB T4.
-def _ensure_swap_active(min_gb: float = 4.0) -> float:
-    try:
-        import psutil
-        if psutil.swap_memory().total / 1e9 >= min_gb:
-            return psutil.swap_memory().total / 1e9
-    except Exception:
-        pass
-    for path, gb in [("/swapfile", 12), ("/content/swapfile", 12), ("/var/swapfile", 8)]:
-        try:
-            run_cmd(f"swapoff {path} 2>/dev/null || true")
-            run_cmd(f"rm -f {path}")
-            if run_cmd(f"fallocate -l {gb}G {path} || dd if=/dev/zero of={path} bs=1M count={gb*1024} status=none") != 0:
-                continue
-            run_cmd(f"chmod 600 {path}")
-            run_cmd(f"mkswap {path}")
-            if run_cmd(f"swapon {path}") == 0:
-                break
-        except Exception:
-            continue
-    try:
-        import psutil
-        return psutil.swap_memory().total / 1e9
-    except Exception:
-        return 0.0
-
-_swap_gb = _ensure_swap_active()
+# NOTE: Swap-partition setup was REMOVED — Colab free-tier blocks `swapon`
+# (it always reported "Swap 0.00 GB"), so it never helped and only added noise.
+# RAM safety instead comes from: reload_dit_per_scene=False, chunked streaming
+# VAE decode, per-scene checkpoints, and (if needed) essential_loras_only /
+# lower render_seconds. Just a lightweight memory report here.
 try:
     import psutil
-    _vm = psutil.virtual_memory()
-    print(f"  📊 Memory: Host RAM {_vm.available/1e9:.2f} GB free / {_vm.total/1e9:.2f} GB | Swap {_swap_gb:.2f} GB")
-    if _swap_gb < 2.0:
-        print("  ⚠️  NO SWAP available (Colab blocked it). Host RAM has NO cushion — if you see "
-              "'session crashed', keep reload_dit_per_scene=False, essential_loras_only=True, "
-              "and/or lower render_seconds (Cell 6).")
+    vm = psutil.virtual_memory()
+    print(f"  📊 Memory: Host RAM {vm.available/1e9:.2f} GB free / {vm.total/1e9:.2f} GB "
+          f"(no swap on Colab free-tier — RAM safety handled in-pipeline)")
 except Exception:
     pass
 
