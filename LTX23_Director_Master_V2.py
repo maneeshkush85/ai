@@ -2176,6 +2176,49 @@ OUTPUT_DIRECTORY = "/content/LTXStudio_Output"
 SONG_PATH = "/content/ComfyUI/input/whatdreamscost/Late night trap.mp3"
 
 
+def _config_signature(meta: Dict[str, Any]) -> str:
+    """Signature of every setting that changes the cached latents. If it differs
+    from the last run, the old checkpoints are STALE (e.g. built at 1280x720) and
+    must be cleared — otherwise resume would reuse old-resolution latents and the
+    render-resolution speed fix would be silently ignored."""
+    return (f"render{meta.get('custom_width')}x{meta.get('custom_height')}"
+            f"|gen{meta.get('generation_width')}x{meta.get('generation_height')}"
+            f"|frames{meta.get('normalDurationFrames')}|fps{meta.get('frame_rate')}"
+            f"|loras{len(globals().get('LORA_STACK', []))}"
+            f"|s1_{STAGE1['steps']}x{STAGE1['denoise']}|s2_{STAGE2['steps']}x{STAGE2['denoise']}")
+
+
+def guard_stale_cache(workdir: str, meta: Dict[str, Any]):
+    """Auto-clear checkpoints when the config changed since the last run (or when
+    caches predate this cache-guard, i.e. no signature file yet)."""
+    os.makedirs(workdir, exist_ok=True)
+    sig = _config_signature(meta)
+    sig_file = os.path.join(workdir, "cache_sig.txt")
+    existing = glob.glob(os.path.join(workdir, "*.pt"))
+    old = None
+    if os.path.exists(sig_file):
+        try:
+            old = open(sig_file).read().strip()
+        except Exception:
+            old = None
+    # Stale if: pre-guard caches exist without a signature, OR signature changed.
+    stale = (old is None and len(existing) > 0) or (old is not None and old != sig)
+    if stale:
+        print(f"🧹 Config changed (or pre-upgrade caches found) → clearing {len(existing)} stale "
+              f"checkpoint(s) so the new {meta.get('custom_width')}x{meta.get('custom_height')} "
+              f"render is actually used (prevents reusing old-resolution latents).")
+        for f in existing:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    try:
+        with open(sig_file, "w") as fh:
+            fh.write(sig)
+    except Exception:
+        pass
+
+
 def run_ltx23_director_master(global_prompt, negative_prompt, meta, segments,
                               audio_segments, motion_segments,
                               seed=0, crf=8, workdir=WORK_DIRECTORY,
@@ -2191,6 +2234,10 @@ def run_ltx23_director_master(global_prompt, negative_prompt, meta, segments,
     os.makedirs(workdir, exist_ok=True)
 
     active_meta = dict(meta)
+
+    # Invalidate stale checkpoints from a previous config (e.g. the old 1280x720
+    # render) so resume never reuses old-resolution latents.
+    guard_stale_cache(workdir, active_meta)
 
     ctrl = DirectorTimelineController(
         global_prompt=global_prompt, negative_prompt=negative_prompt,
