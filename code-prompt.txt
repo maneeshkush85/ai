@@ -1,0 +1,2050 @@
+You are an expert Python, ComfyUI, LTX-Video/LTX-2.5, PyTorch, CUDA-memory optimization, Google Colab, and workflow-to-code conversion engineer.
+
+I am building a production-quality Google Colab notebook/Python implementation from a very large ComfyUI workflow.
+
+============================================================
+SOURCE WORKFLOW
+============================================================
+
+Primary source workflow:
+
+@LTX_2.5_All-In-One_Workflow.json
+
+Reference implementation:
+
+@LTX23_Director_V6.py
+
+The LTX23_Director_V6.py file is the architectural/reference implementation for how a large LTX workflow should be converted into a Google Colab Python pipeline.
+
+DO NOT simply copy LTX23_Director_V6.py.
+
+DO NOT assume that LTX-2.5 uses the exact same node names, models, parameters, latent structure, LoRAs, VAEs, samplers, or workflow graph as LTX-2.3.
+
+Instead:
+
+1. Read the ENTIRE LTX 2.5 JSON.
+2. Reverse-engineer every functional branch.
+3. Identify every model, LoRA, VAE, text encoder, sampler, scheduler, conditioning node, latent node, audio node, lipsync node, upscale node, image node, video node, and output node.
+4. Reconstruct the actual LTX 2.5 graph in Python.
+5. Preserve the workflow's real behavior.
+6. Use LTX23_Director_V6.py only as the engineering architecture for memory management, phase isolation, scene processing, checkpointing, and Colab stability.
+
+The final implementation must be a REAL conversion of the supplied JSON workflow, not a simplified imitation.
+
+============================================================
+WORKFLOW SIZE
+============================================================
+
+The workflow is expected to be a very large LTX 2.5 all-in-one workflow.
+
+The supplied workflow description states:
+
+- approximately 5,903 nodes
+- approximately 14,781 links
+
+Treat these numbers as requirements to verify against the actual JSON.
+
+DO NOT blindly trust these numbers.
+
+When reading the JSON, calculate and report:
+
+- actual node count
+- actual link count
+- node type frequency
+- connected components
+- major execution branches
+- model-loading nodes
+- LoRA nodes
+- VAE nodes
+- text encoders
+- conditioning nodes
+- sampler/scheduler nodes
+- latent nodes
+- audio nodes
+- video nodes
+- upscale nodes
+- output nodes
+
+If the actual numbers differ from the description, report the actual numbers and explain the difference.
+
+============================================================
+PRIMARY OBJECTIVE
+============================================================
+
+Convert:
+
+LTX_2.5_All-In-One_Workflow(1).json
+
+into:
+
+A complete Google Colab-compatible Python notebook implementation.
+
+The result must behave like the original ComfyUI workflow while being optimized for:
+
+- Google Colab
+- NVIDIA Tesla T4
+- approximately 15 GB VRAM
+- limited system RAM
+- long video generation
+- multi-scene generation
+- image-to-video
+- text-to-video
+- audio-to-video
+- lipsync
+- native audio
+- latent upscaling
+- high-resolution generation
+- batch frame generation
+- resume after interruption
+- automatic memory cleanup
+- disk-based intermediate caching
+
+============================================================
+CRITICAL REQUIREMENT
+============================================================
+
+DO NOT create a fake or generic LTX pipeline.
+
+DO NOT write:
+
+"Here is a simplified implementation."
+
+DO NOT replace missing workflow functionality with placeholders.
+
+DO NOT invent node behavior.
+
+DO NOT invent model filenames.
+
+DO NOT invent Hugging Face URLs.
+
+DO NOT invent LoRA URLs.
+
+DO NOT invent sampler settings.
+
+DO NOT invent scheduler settings.
+
+DO NOT invent latent dimensions.
+
+DO NOT invent VAE settings.
+
+DO NOT invent audio settings.
+
+Every important implementation detail must come from:
+
+A. the supplied LTX 2.5 JSON
+OR
+B. the supplied LTX23_Director_V6.py reference architecture
+OR
+C. an explicitly documented compatibility layer when direct node execution is impossible.
+
+If something cannot be determined from the JSON, clearly mark it:
+
+TODO — REQUIRES SOURCE VERIFICATION
+
+Do not silently guess.
+
+============================================================
+WHAT THE WORKFLOW CONTAINS
+============================================================
+
+The workflow is a large LTX 2.5 all-in-one video generation pipeline.
+
+At the top level, identify and preserve these major functional sections:
+
+1. Models
+2. LoRA
+3. Settings
+4. Text → Video + Audio
+5. Image → Video + Audio
+6. Audio → Video
+7. Lipsync — Image + Audio → Video + Audio
+8. Low-resolution generation
+9. Latent upscale
+10. High-resolution generation
+11. Native LTX 2.5 audio
+12. Audio latent noise / lipsync
+13. Video/audio output
+
+These are NOT merely UI labels.
+
+Map each section to its actual JSON nodes and links.
+
+============================================================
+REQUIRED USER INTERFACE
+============================================================
+
+Create a Google Colab-friendly user interface.
+
+The user must be able to select the generation mode using a DROPDOWN MENU.
+
+Required dropdown:
+
+Generation Mode
+
+Options:
+
+1. Text → Video + Audio
+2. Image → Video + Audio
+3. Audio → Video
+4. Lipsync — Image + Audio → Video + Audio
+
+Example:
+
+generation_mode = widgets.Dropdown(
+    options=[
+        "Text → Video + Audio",
+        "Image → Video + Audio",
+        "Audio → Video",
+        "Lipsync — Image + Audio → Video + Audio"
+    ],
+    description="Mode:"
+)
+
+The selected mode must determine which workflow branch is executed.
+
+IMPORTANT:
+
+Do NOT execute unnecessary branches.
+
+If the user selects:
+
+Text → Video + Audio
+
+then do not load:
+
+- image-conditioning-only components
+- audio-input-only components
+- lipsync-only components
+
+unless the original JSON requires them.
+
+If the user selects:
+
+Image → Video + Audio
+
+load only the components necessary for that path.
+
+If the user selects:
+
+Audio → Video
+
+load only the components necessary for that path.
+
+If the user selects:
+
+Lipsync
+
+load only the components required for lipsync.
+
+============================================================
+ADDITIONAL UI CONTROLS
+============================================================
+
+Create controls for:
+
+- generation mode
+- prompt
+- negative prompt
+- input image
+- input audio
+- reference image
+- seed
+- random seed button
+- width
+- height
+- FPS
+- duration
+- number of frames
+- batch size
+- low-resolution generation settings
+- latent upscale settings
+- high-resolution settings
+- sampler
+- scheduler
+- steps
+- CFG/guidance
+- denoise
+- LoRA enable/disable
+- LoRA strength
+- audio enable/disable
+- native audio enable/disable
+- lipsync settings
+- overlap frames
+- tile size
+- tile overlap
+- resume
+- cache directory
+- output format
+- output quality
+- preview enable/disable
+
+Only expose settings that actually exist in the source workflow or are required to control the converted pipeline.
+
+Do not invent arbitrary parameters.
+
+============================================================
+GOOGLE COLAB NOTEBOOK STRUCTURE
+============================================================
+
+Generate the notebook as clearly separated cells.
+
+Recommended structure:
+
+CELL 1 — Environment / GPU verification
+
+CELL 2 — Install dependencies
+
+CELL 3 — Install/clone ComfyUI and required custom nodes
+
+CELL 4 — Detect Tesla T4 / CUDA / VRAM / RAM
+
+CELL 5 — Model download manager
+
+CELL 6 — Validate downloaded models
+
+CELL 7 — Import ComfyUI nodes
+
+CELL 8 — Memory management utilities
+
+CELL 9 — Workflow JSON parser
+
+CELL 10 — Workflow graph analyzer
+
+CELL 11 — Model/LoRA registry
+
+CELL 12 — Input/upload UI
+
+CELL 13 — Generation mode dropdown
+
+CELL 14 — Text → Video + Audio branch
+
+CELL 15 — Image → Video + Audio branch
+
+CELL 16 — Audio → Video branch
+
+CELL 17 — Lipsync branch
+
+CELL 18 — Low-resolution generation
+
+CELL 19 — Latent upscale
+
+CELL 20 — High-resolution generation
+
+CELL 21 — Native audio generation
+
+CELL 22 — Audio latent/lipsync processing
+
+CELL 23 — Batch frame generation
+
+CELL 24 — Disk checkpoint manager
+
+CELL 25 — Tiled VAE decoding
+
+CELL 26 — Audio decoding
+
+CELL 27 — Scene/frame assembly
+
+CELL 28 — Video/audio muxing
+
+CELL 29 — Final preview
+
+CELL 30 — Run generation
+
+============================================================
+OUT-OF-CORE 4-PHASE LIFECYCLE
+============================================================
+
+The central engineering requirement is:
+
+NEVER keep every major model component in GPU memory simultaneously.
+
+Implement strict phase isolation.
+
+The architecture should follow:
+
+PHASE A
+Text Conditioning
+
+PHASE B
+Diffusion / Generation
+
+PHASE C
+Tiled VAE Decode
+
+PHASE D
+Assembly / Output
+
+============================================================
+PHASE A — TEXT CONDITIONING
+============================================================
+
+Load only the text-conditioning components required by the selected mode.
+
+For example, if the actual workflow uses:
+
+- Gemma
+- LTX text projection
+- CLIP
+- dual text encoders
+- tokenizer
+- conditioning nodes
+
+load them.
+
+Encode:
+
+- global prompt
+- scene prompts
+- negative prompt
+- mode-specific prompt
+- audio/lipsync conditioning when required
+
+Store the resulting conditioning objects.
+
+Then immediately destroy unnecessary text encoder objects.
+
+Perform:
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
+torch.cuda.ipc_collect()
+
+ComfyUI model cleanup.
+
+Remove references.
+
+Run an aggressive memory purge.
+
+The objective is:
+
+TEXT ENCODERS MUST NOT REMAIN LOADED DURING DIFFUSION IF THEY ARE NO LONGER REQUIRED.
+
+Use the architecture from LTX23_Director_V6.py:
+
+load → encode → delete → purge_deep()
+
+============================================================
+PHASE B — DIFFUSION / GENERATION
+============================================================
+
+Load the actual LTX 2.5 diffusion/DiT model required by the JSON.
+
+Load only the LoRAs required by the selected generation path.
+
+Apply any memory optimization nodes actually present in the JSON.
+
+Examples from the reference architecture include:
+
+- GGUF loading
+- SageAttention
+- ChunkFeedForward
+- model-only LoRA loading
+
+BUT:
+
+Do not assume these are present in LTX 2.5.
+
+Check the actual JSON first.
+
+============================================================
+STRICT PER-BATCH / PER-SEGMENT MODEL LIFECYCLE
+============================================================
+
+For a long video:
+
+DO NOT generate the entire video in one enormous tensor.
+
+Divide generation into manageable frame batches/segments.
+
+Example architecture:
+
+Batch 001
+↓
+Generate
+↓
+Save latent
+↓
+Delete GPU tensors
+↓
+Purge memory
+
+Batch 002
+↓
+Generate
+↓
+Save latent
+↓
+Delete GPU tensors
+↓
+Purge memory
+
+Batch 003
+↓
+Generate
+↓
+Save latent
+↓
+Delete GPU tensors
+↓
+Purge memory
+
+Continue until complete.
+
+The exact segmentation must respect LTX 2.5's actual latent/frame constraints from the JSON.
+
+============================================================
+BATCH FRAME GENERATION
+============================================================
+
+Implement a robust frame batching system.
+
+Requirements:
+
+- never allocate the complete long-duration video unnecessarily
+- generate only a controlled number of frames at once
+- respect the workflow's temporal latent constraints
+- automatically calculate valid frame counts
+- preserve FPS
+- preserve temporal overlap where required
+- optionally overlap neighboring batches
+- save each generated latent batch to disk
+- release GPU memory before the next batch
+
+Example:
+
+frames = calculate_valid_frame_count(
+    duration_seconds,
+    fps,
+    workflow_constraints
+)
+
+Then split:
+
+frame_batches = create_batches(
+    frames,
+    max_frames_per_batch
+)
+
+Each batch must be independently resumable.
+
+============================================================
+DISK CHECKPOINT SYSTEM
+============================================================
+
+Use:
+
+/content/LTX25_work/
+
+Create:
+
+latents/
+frames/
+audio/
+previews/
+outputs/
+metadata/
+logs/
+
+Example:
+
+/content/LTX25_work/
+    latents/
+        batch_0001.pt
+        batch_0002.pt
+        batch_0003.pt
+
+    frames/
+        batch_0001.pt
+        batch_0002.pt
+
+    audio/
+        batch_0001.pt
+        batch_0002.pt
+
+    previews/
+        preview_0001.mp4
+
+    metadata/
+        generation.json
+
+    outputs/
+        final.mp4
+
+============================================================
+RESUME SUPPORT
+============================================================
+
+This is mandatory.
+
+If:
+
+batch_0001.pt
+
+already exists and is valid:
+
+SKIP generation.
+
+If:
+
+batch_0002.pt
+
+exists:
+
+SKIP batch 2.
+
+If Colab crashes during batch 3:
+
+restart notebook and continue from batch 3.
+
+Never force the user to regenerate completed batches.
+
+Validate cached files before trusting them.
+
+Check:
+
+- file exists
+- file size > 0
+- torch.load succeeds
+- expected keys exist
+- tensor shapes are valid
+- metadata matches current settings
+
+If settings changed, invalidate incompatible cache entries.
+
+Generate a deterministic configuration hash.
+
+Example:
+
+config_hash = SHA256(
+    prompt +
+    negative_prompt +
+    seed +
+    resolution +
+    fps +
+    generation_mode +
+    relevant workflow settings
+)
+
+Use the hash to prevent accidental reuse of incompatible latents.
+
+============================================================
+AUTOMATIC MEMORY MANAGEMENT
+============================================================
+
+Implement aggressive automatic memory management.
+
+Create:
+
+purge()
+
+purge_deep()
+
+ram_guard()
+
+gpu_memory_report()
+
+system_memory_report()
+
+memory_cleanup()
+
+The architecture should follow the reference implementation.
+
+Use:
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
+torch.cuda.ipc_collect()
+
+ComfyUI model-management cleanup.
+
+Where supported, unload all models.
+
+Clear model registries where safe.
+
+Clear Python references.
+
+Remove cached tensors.
+
+Drop OS file-backed model pages where safely supported.
+
+IMPORTANT:
+
+Do not use dangerous memory operations without checking platform support.
+
+The code must gracefully fall back if:
+
+os.posix_fadvise
+
+is unavailable.
+
+============================================================
+MEMORY THRESHOLD SYSTEM
+============================================================
+
+Monitor:
+
+GPU allocated
+GPU reserved
+GPU free
+system RAM used
+system RAM available
+
+Before every expensive operation:
+
+memory_guard()
+
+Example policy:
+
+if free_RAM < configured_threshold:
+    deep_cleanup()
+
+if GPU free memory < required_estimate:
+    unload_nonessential_models()
+
+Before VAE decoding:
+
+deep_cleanup()
+
+Before loading a large DiT:
+
+deep_cleanup()
+
+After diffusion:
+
+deep_cleanup()
+
+After VAE:
+
+deep_cleanup()
+
+============================================================
+NO SESSION RESTARTS
+============================================================
+
+The notebook must be designed specifically to prevent:
+
+"Your session restarted after a crash."
+
+Do not solve OOM by merely catching an exception.
+
+Prevent OOM proactively.
+
+Requirements:
+
+1. Phase isolation.
+2. Per-batch generation.
+3. CPU/disk checkpointing.
+4. Tiled VAE decoding.
+5. Automatic cleanup.
+6. RAM monitoring.
+7. GPU memory monitoring.
+8. Model unloading.
+9. No unnecessary duplicate model instances.
+10. No simultaneous loading of large models.
+11. No unnecessary full-resolution tensors.
+12. Explicit deletion of intermediate tensors.
+13. Resume after interruption.
+
+If an operation is likely to exceed T4 memory:
+
+reduce batch size / frame batch size before execution.
+
+Do not blindly retry the exact same operation.
+
+============================================================
+PHASE B — LOW-RES GENERATION
+============================================================
+
+If the JSON contains a low-resolution generation branch:
+
+reproduce it exactly.
+
+Preserve:
+
+- resolution
+- latent dimensions
+- frame count
+- sampler
+- scheduler
+- steps
+- CFG
+- denoise
+- seed behavior
+- conditioning
+- reference-image conditioning
+- audio conditioning
+
+Do not replace it with generic KSampler logic unless the source graph actually uses equivalent nodes.
+
+============================================================
+LATENT UPSCALE
+============================================================
+
+If the JSON contains a latent upscaler:
+
+reproduce the actual workflow.
+
+The architecture should be:
+
+LOW-RES LATENT
+↓
+LATENT UPSCALE
+↓
+HIGH-RES LATENT
+↓
+HIGH-RES REFINEMENT
+
+The upscaler model must be loaded only when needed.
+
+After upscaling:
+
+delete unnecessary low-resolution objects.
+
+purge memory.
+
+============================================================
+PHASE B — HIGH-RES GENERATION
+============================================================
+
+Reproduce the actual high-resolution branch from JSON.
+
+Do not decode low-resolution frames unnecessarily.
+
+Keep the process latent-space based wherever the workflow does so.
+
+Only decode to pixels at the final required stage.
+
+============================================================
+PHASE C — TILED VAE DECODING
+============================================================
+
+This is critical for Tesla T4.
+
+NEVER decode a long high-resolution video as one giant tensor.
+
+Decode batch-by-batch.
+
+Use the exact VAE from the JSON.
+
+If the workflow supports tiled VAE:
+
+use it.
+
+If the JSON contains:
+
+- spatial tiling
+- temporal tiling
+- tile overlap
+- temporal overlap
+
+preserve those values.
+
+If the exact custom tiled node is unavailable:
+
+implement a compatibility fallback.
+
+Preferred fallback order:
+
+1. Exact workflow tiled decoder.
+2. ComfyUI tiled VAE decoder.
+3. Controlled manual tiled decoding.
+4. Full decode ONLY as an explicit emergency fallback.
+
+Never silently fall back to full-resolution full-video decoding.
+
+============================================================
+TILE SETTINGS
+============================================================
+
+Default target for T4:
+
+256 × 256 spatial tiles.
+
+But:
+
+DO NOT hard-code this if the JSON specifies another value.
+
+Use:
+
+workflow_tile_size
+
+and expose it as a configurable parameter.
+
+Also preserve:
+
+- tile overlap
+- temporal tile length
+- temporal overlap
+
+from the actual workflow.
+
+============================================================
+AUDIO VAE
+============================================================
+
+Treat audio separately from video where required.
+
+Load audio VAE only when necessary.
+
+Decode audio batch-by-batch.
+
+Save audio tensors to disk.
+
+Delete the audio VAE immediately after its phase.
+
+Avoid keeping video VAE + audio VAE + DiT + text encoder in memory simultaneously.
+
+============================================================
+NATIVE LTX 2.5 AUDIO
+============================================================
+
+The LTX 2.5 workflow contains native audio functionality.
+
+Map the actual audio nodes from JSON.
+
+Preserve:
+
+- audio latent generation
+- audio latent noise
+- audio conditioning
+- native audio generation
+- audio VAE
+- audio/video latent concatenation
+- audio/video latent separation
+- audio decoding
+- audio/video synchronization
+
+Do not treat audio as an optional FFmpeg replacement if the actual workflow generates native LTX audio.
+
+============================================================
+AUDIO LATENT NOISE / LIPSYNC
+============================================================
+
+Identify the exact nodes in the JSON used for:
+
+- audio latent noise
+- lipsync conditioning
+- audio-to-video
+- image+audio lipsync
+- native audio synchronization
+
+Reconstruct those branches exactly.
+
+Lipsync must preserve:
+
+- mouth movement
+- timing
+- audio alignment
+- facial identity
+- temporal consistency
+
+Do not substitute a generic talking-head pipeline.
+
+============================================================
+GENERATION MODES
+============================================================
+
+Implement these four modes:
+
+--------------------------------
+MODE 1
+TEXT → VIDEO + AUDIO
+--------------------------------
+
+Inputs:
+
+Prompt
+Negative prompt
+Seed
+Resolution
+Duration
+FPS
+Relevant workflow settings
+
+Outputs:
+
+Video
+Native/generated audio when enabled
+
+--------------------------------
+MODE 2
+IMAGE → VIDEO + AUDIO
+--------------------------------
+
+Inputs:
+
+Reference image
+Prompt
+Negative prompt
+Seed
+Resolution
+Duration
+FPS
+
+Preserve the workflow's image-conditioning path.
+
+--------------------------------
+MODE 3
+AUDIO → VIDEO
+--------------------------------
+
+Inputs:
+
+Audio file
+Prompt if required
+Reference image if required by source workflow
+Relevant audio conditioning
+
+Output:
+
+Video synchronized to audio.
+
+--------------------------------
+MODE 4
+LIPSYNC — IMAGE + AUDIO → VIDEO + AUDIO
+--------------------------------
+
+Inputs:
+
+Image
+Audio
+Prompt if required
+
+Output:
+
+Lip-synchronized video with audio.
+
+============================================================
+REFERENCE IMAGE CONSISTENCY
+============================================================
+
+Use the LTX23_Director_V6.py architecture as inspiration for reference-image caching.
+
+If the LTX 2.5 workflow contains image anchors/reference conditioning:
+
+preprocess once.
+
+Cache the processed reference.
+
+Reuse it across batches.
+
+Do not reload and preprocess the same image for every frame batch unnecessarily.
+
+Preserve identity consistently.
+
+============================================================
+SCENE / SEGMENT SYSTEM
+============================================================
+
+Support long videos through scene/segment configuration.
+
+Each segment should support:
+
+{
+    "id": 1,
+    "prompt": "...",
+    "seconds": 5,
+    "seed": 12345,
+    "image": null,
+    "audio": null
+}
+
+But only expose fields that are compatible with the actual JSON.
+
+Allow:
+
+- multiple scenes
+- per-scene prompt
+- per-scene seed
+- per-scene reference
+- per-scene duration
+- per-scene settings when supported
+
+============================================================
+TEMPORAL OVERLAP
+============================================================
+
+If the workflow requires overlap between segments:
+
+implement overlap blending.
+
+For video:
+
+previous tail
++
+new head
+↓
+linear temporal crossfade
+
+For audio:
+
+previous audio tail
++
+new audio head
+↓
+audio crossfade
+
+Make overlap frame count configurable.
+
+Never create duplicate frames accidentally.
+
+============================================================
+AUDIO SHAPE ROBUSTNESS
+============================================================
+
+Audio tensors may have different layouts.
+
+Do NOT blindly assume:
+
+[B, C, S]
+
+Detect the samples dimension safely.
+
+Support common layouts.
+
+Perform:
+
+- crossfade
+- trim
+- concatenation
+- duration matching
+
+without hard-coded tensor dimensions.
+
+============================================================
+FINAL ASSEMBLY
+============================================================
+
+The final assembly should happen after GPU-heavy operations have completed.
+
+Prefer CPU/disk streaming.
+
+Process:
+
+cached frames
+↓
+temporal overlap
+↓
+final frame sequence
+↓
+cached audio
+↓
+audio overlap
+↓
+duration alignment
+↓
+video creation
+↓
+audio mux
+↓
+final MP4
+
+Avoid keeping intermediate GPU tensors alive.
+
+============================================================
+OUTPUT
+============================================================
+
+Save:
+
+/content/LTX25_work/outputs/
+
+Example:
+
+LTX25_TextToVideo_YYYYMMDD_HHMMSS.mp4
+
+LTX25_ImageToVideo_YYYYMMDD_HHMMSS.mp4
+
+LTX25_AudioToVideo_YYYYMMDD_HHMMSS.mp4
+
+LTX25_Lipsync_YYYYMMDD_HHMMSS.mp4
+
+Also save metadata:
+
+generation_metadata.json
+
+Include:
+
+- generation mode
+- prompt
+- negative prompt
+- seed
+- resolution
+- FPS
+- frame count
+- duration
+- workflow hash
+- model names
+- LoRA names
+- LoRA strengths
+- sampler
+- scheduler
+- steps
+- CFG
+- denoise
+- tile settings
+- timestamp
+- batch count
+
+============================================================
+VIDEO ENCODING
+============================================================
+
+Use FFmpeg where appropriate.
+
+Preserve:
+
+- FPS
+- resolution
+- audio synchronization
+- H.264/H.265 settings if specified by workflow
+- CRF if specified
+- pixel format
+- audio codec
+
+Do not arbitrarily change source workflow output settings.
+
+============================================================
+PREVIEW SYSTEM
+============================================================
+
+Implement optional lightweight previews.
+
+Preview should NOT require decoding the complete final video.
+
+For long videos:
+
+generate preview from selected batches or a limited number of frames.
+
+If the workflow contains a tiny VAE preview mechanism, reproduce it.
+
+Otherwise implement a safe lightweight preview path.
+
+============================================================
+MODEL DOWNLOAD MANAGER
+============================================================
+
+Create a robust downloader similar to LTX23_Director_V6.py.
+
+Requirements:
+
+- resume downloads
+- skip existing valid files
+- verify file size
+- report failures
+- retry failed downloads
+- create directories automatically
+- avoid redownloading
+- support Hugging Face
+- support direct URLs
+- support Civitai only if credentials are explicitly supplied
+- never hard-code private tokens
+
+IMPORTANT:
+
+Extract actual model URLs and filenames from the supplied workflow/reference.
+
+Do not invent download URLs.
+
+If the JSON contains only a model filename and no URL:
+
+create a clearly marked MODEL_URL_REQUIRED variable.
+
+============================================================
+MODEL REGISTRY
+============================================================
+
+Create a registry such as:
+
+MODEL_REGISTRY = {
+    "diffusion": ...,
+    "text_encoder": ...,
+    "text_encoder_2": ...,
+    "vae": ...,
+    "audio_vae": ...,
+    "upscaler": ...,
+    "loras": ...
+}
+
+Populate it from the actual workflow.
+
+============================================================
+LAZY MODEL LOADING
+============================================================
+
+Models must be loaded only when required.
+
+Example:
+
+get_text_encoders()
+release_text_encoders()
+
+get_diffusion_model()
+release_diffusion_model()
+
+get_video_vae()
+release_video_vae()
+
+get_audio_vae()
+release_audio_vae()
+
+get_upscaler()
+release_upscaler()
+
+Never preload everything at startup.
+
+============================================================
+MODEL EXCLUSIVITY
+============================================================
+
+Implement a model lifecycle manager.
+
+For example:
+
+with model_phase("text"):
+    encode_prompts()
+
+with model_phase("diffusion"):
+    generate_batches()
+
+with model_phase("video_vae"):
+    decode_video()
+
+with model_phase("audio_vae"):
+    decode_audio()
+
+Before entering a new phase:
+
+release_previous_phase()
+
+deep_memory_cleanup()
+
+============================================================
+TORCH MEMORY SETTINGS
+============================================================
+
+Use appropriate CUDA allocator configuration.
+
+For example:
+
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True"
+)
+
+Do not assume this alone solves OOM.
+
+Combine allocator configuration with actual model unloading and batch processing.
+
+============================================================
+T4 HARDWARE ADAPTATION
+============================================================
+
+Detect the actual GPU.
+
+Example:
+
+torch.cuda.get_device_name(0)
+
+Detect VRAM.
+
+If Tesla T4 / approximately 15 GB:
+
+automatically select the safest profile.
+
+Example conceptual profiles:
+
+T4_SAFE
+COLAB_HIGH_RAM
+COLAB_PRO
+CUSTOM_GPU
+
+Do not claim a profile guarantees zero OOM.
+
+Instead dynamically adapt:
+
+- batch size
+- frame batch size
+- tile size
+- VAE tile mode
+- CPU offload
+- model unload frequency
+- preview
+- high-resolution generation
+
+============================================================
+OOM RECOVERY
+============================================================
+
+Implement structured OOM recovery.
+
+Pseudo behavior:
+
+try:
+    generate_batch()
+
+except torch.cuda.OutOfMemoryError:
+
+    log_memory()
+
+    save current checkpoint if possible
+
+    release temporary tensors
+
+    unload models
+
+    purge_deep()
+
+    reduce batch size
+
+    retry safely
+
+IMPORTANT:
+
+Never retry infinitely.
+
+Use:
+
+MAX_OOM_RETRIES
+
+After the maximum:
+
+save diagnostic information and stop gracefully.
+
+Do not crash the entire Colab runtime.
+
+============================================================
+AUTOMATIC BATCH SIZE ADAPTATION
+============================================================
+
+Start with a conservative batch size.
+
+If OOM:
+
+batch_size = max(1, batch_size // 2)
+
+If still OOM:
+
+reduce frame batch size.
+
+If still OOM:
+
+increase VAE tiling.
+
+If still OOM:
+
+enable CPU offload where supported.
+
+If still OOM:
+
+stop gracefully and explain exactly which operation caused the failure.
+
+============================================================
+NO UNNECESSARY DUPLICATION
+============================================================
+
+Avoid:
+
+duplicate model instances
+duplicate VAEs
+duplicate conditioning objects
+duplicate frame tensors
+duplicate latent tensors
+duplicate decoded videos
+
+Explicitly delete:
+
+temporary outputs
+old latents
+unused conditioning
+unused references
+sampler objects when appropriate
+
+============================================================
+WORKFLOW GRAPH EXECUTION
+============================================================
+
+This is extremely important.
+
+Do not manually reproduce 5,903 nodes as 5,903 Python variables.
+
+Instead:
+
+1. Parse JSON.
+2. Build a workflow graph.
+3. Identify relevant execution paths.
+4. Build reusable Python wrappers around actual node types.
+5. Execute only the selected branch.
+6. Preserve dependency order.
+7. Preserve node parameters.
+8. Preserve links.
+9. Preserve seed values.
+10. Preserve model references.
+
+Create:
+
+WorkflowGraph
+
+WorkflowNode
+
+WorkflowLink
+
+WorkflowBranch
+
+WorkflowExecutor
+
+classes where useful.
+
+============================================================
+NODE MAPPING
+============================================================
+
+Create a mapping/report:
+
+JSON Node ID
+→
+Node Type
+→
+Python wrapper
+→
+Input parameters
+→
+Output parameters
+→
+Dependencies
+
+For unsupported nodes:
+
+raise a clear error:
+
+Unsupported LTX 2.5 node:
+<NodeType>
+
+JSON node ID:
+<ID>
+
+Required for:
+<function>
+
+Do NOT silently skip it.
+
+============================================================
+NODE EXECUTION STRATEGY
+============================================================
+
+Prefer using the actual ComfyUI node implementations where practical.
+
+Example architecture:
+
+node = NODE_CLASS_MAPPINGS[node_type]()
+
+result = node.execute(...)
+
+or the exact execution API required by that node.
+
+Do not assume every node has the same method.
+
+Inspect the actual node class/API.
+
+Support:
+
+EXECUTE_NORMALIZED
+
+execute
+
+load_model
+
+encode
+
+decode
+
+or the exact interface required by the installed node.
+
+Create a robust adapter layer.
+
+============================================================
+COMFYUI COMPATIBILITY
+============================================================
+
+Pin compatible ComfyUI/custom-node versions where the source workflow requires them.
+
+Do not blindly install latest versions.
+
+Record:
+
+ComfyUI version
+custom-node commit/version
+PyTorch version
+CUDA version
+
+in generation metadata.
+
+============================================================
+DEPENDENCY VALIDATION
+============================================================
+
+Before generation run:
+
+validate_dependencies()
+
+Check:
+
+- torch
+- CUDA
+- ComfyUI
+- custom nodes
+- model files
+- LoRAs
+- VAEs
+- ffmpeg
+- required Python packages
+
+Report missing dependencies before beginning expensive generation.
+
+============================================================
+WORKFLOW VALIDATION
+============================================================
+
+Before execution validate:
+
+- all referenced node IDs exist
+- all links point to valid nodes
+- all required models exist
+- all required node types are registered
+- selected mode has a valid execution path
+- required inputs exist
+- frame dimensions are valid
+- duration is valid
+- FPS is valid
+- output path is writable
+
+============================================================
+LOGGING
+============================================================
+
+Create readable phase logs.
+
+Example:
+
+============================================================
+LTX 2.5 ALL-IN-ONE
+============================================================
+
+Mode:
+Image → Video + Audio
+
+GPU:
+Tesla T4
+
+VRAM:
+14.75 GB
+
+System RAM:
+...
+
+Workflow:
+5903 nodes / 14781 links
+
+============================================================
+PHASE A — TEXT CONDITIONING
+============================================================
+
+Loading text encoders...
+Encoding prompts...
+Text conditioning complete.
+
+Freeing text encoders...
+Memory cleanup complete.
+
+============================================================
+PHASE B — DIFFUSION
+============================================================
+
+Batch 1/12
+Frames: 1–81
+
+Loading DiT...
+Loading LoRAs...
+
+Stage:
+Low resolution
+
+Generating...
+
+Saving latent:
+latent_0001.pt
+
+Unloading DiT...
+
+Memory:
+GPU ...
+RAM ...
+
+============================================================
+PHASE C — VAE
+============================================================
+
+Batch 1/12
+
+Tile:
+256 × 256
+
+Decoding...
+
+Saving:
+frames_0001.pt
+
+============================================================
+PHASE D — ASSEMBLY
+============================================================
+
+Combining frames...
+Blending overlap...
+Combining audio...
+Encoding final video...
+
+============================================================
+COMPLETE
+============================================================
+
+============================================================
+ERROR HANDLING
+============================================================
+
+Every major operation must use controlled exception handling.
+
+Never hide errors using:
+
+except:
+    pass
+
+unless the failure is explicitly optional and documented.
+
+Instead:
+
+except Exception as e:
+    log_error(...)
+    cleanup(...)
+    continue only when safe
+
+============================================================
+COLAB SESSION CRASH PROTECTION
+============================================================
+
+The entire notebook must be designed so that a Colab runtime interruption does not destroy all progress.
+
+Checkpoint after:
+
+- prompt encoding
+- every generated batch
+- every VAE-decoded batch
+- every audio batch
+- final assembly stages
+
+Write state:
+
+state.json
+
+Example:
+
+{
+    "workflow_hash": "...",
+    "mode": "...",
+    "completed_generation_batches": [1,2,3],
+    "completed_decode_batches": [1,2],
+    "current_phase": "diffusion",
+    "last_successful_batch": 3
+}
+
+On restart:
+
+load_state()
+
+resume automatically.
+
+============================================================
+IMPORTANT: GOOGLE COLAB STORAGE
+============================================================
+
+Support optional Google Drive working directory.
+
+Example:
+
+/content/LTX25_work
+
+or:
+
+/content/drive/MyDrive/LTX25_work
+
+Allow user to select:
+
+Storage Mode
+
+Options:
+
+Local Colab
+Google Drive
+
+If using Drive:
+
+do not constantly write tiny files.
+
+Use sensible checkpoint intervals.
+
+============================================================
+FINAL NOTEBOOK QUALITY
+============================================================
+
+The output must be:
+
+- complete
+- executable
+- modular
+- readable
+- heavily commented
+- production-oriented
+- Colab-friendly
+- T4-aware
+- resumable
+- memory-safe
+- branch-aware
+- based on the actual JSON
+
+Do not give me pseudocode.
+
+Do not give me partial code.
+
+Do not say:
+
+"implement this yourself."
+
+Do not leave major functions as:
+
+pass
+
+TODO
+
+placeholder
+
+unless the source JSON genuinely does not provide enough information.
+
+============================================================
+CRITICAL SOURCE-OF-TRUTH RULE
+============================================================
+
+SOURCE #1:
+LTX_2.5_All-In-One_Workflow(1).json
+
+This determines:
+
+- actual node graph
+- actual parameters
+- actual models
+- actual LoRAs
+- actual samplers
+- actual schedulers
+- actual resolutions
+- actual latent structure
+- actual audio architecture
+- actual lipsync architecture
+- actual upscale architecture
+- actual output architecture
+
+SOURCE #2:
+LTX23_Director_V6.py
+
+This determines the preferred ENGINEERING ARCHITECTURE:
+
+- Colab cell organization
+- memory cleanup
+- phase isolation
+- per-segment model loading
+- disk checkpointing
+- resume support
+- tiled decoding
+- audio shape robustness
+- scene/batch processing
+- output assembly
+- crash recovery
+
+Do not confuse the two.
+
+The LTX 2.3 Python file is an engineering reference, NOT the source of truth for LTX 2.5 model/node parameters.
+
+============================================================
+MANDATORY FIRST STEP BEFORE WRITING CODE
+============================================================
+
+Before generating Python code, analyze the JSON.
+
+Produce an internal/explanatory analysis containing:
+
+1. Workflow statistics
+2. Node categories
+3. Model registry
+4. LoRA registry
+5. Text encoder architecture
+6. Text-to-video branch
+7. Image-to-video branch
+8. Audio-to-video branch
+9. Lipsync branch
+10. Low-resolution branch
+11. Latent upscale branch
+12. High-resolution branch
+13. Native audio branch
+14. Audio latent/lipsync branch
+15. Output branch
+16. Shared nodes
+17. Branch-specific nodes
+18. Potential VRAM hotspots
+19. Potential CPU RAM hotspots
+20. Nodes that must be isolated into separate phases
+21. Nodes that can safely stay resident
+22. Required custom nodes
+23. Required model downloads
+24. Unsupported/ambiguous nodes
+25. Exact execution order
+
+Then generate the Python notebook.
+
+============================================================
+FINAL CODE ORGANIZATION
+============================================================
+
+The final Python notebook should expose a clean high-level API such as:
+
+result = generate_ltx25(
+    mode=generation_mode,
+    prompt=prompt,
+    negative_prompt=negative_prompt,
+    image_path=image_path,
+    audio_path=audio_path,
+    seed=seed,
+    width=width,
+    height=height,
+    fps=fps,
+    duration=duration,
+    resume=True
+)
+
+Internally:
+
+generate_ltx25()
+    ↓
+validate_inputs()
+    ↓
+load_workflow_config()
+    ↓
+select_branch()
+    ↓
+phase_a_conditioning()
+    ↓
+phase_b_generation()
+    ↓
+phase_c_decode()
+    ↓
+phase_d_assembly()
+    ↓
+final_output()
+
+============================================================
+SUCCESS CRITERIA
+============================================================
+
+The implementation is considered successful only when:
+
+[ ] Actual LTX 2.5 JSON has been analyzed.
+[ ] Actual node/link counts have been verified.
+[ ] Actual model dependencies have been extracted.
+[ ] Actual LoRAs have been extracted.
+[ ] All four generation modes are represented.
+[ ] Text → Video works.
+[ ] Image → Video works.
+[ ] Audio → Video works.
+[ ] Lipsync works.
+[ ] Low-res branch is preserved.
+[ ] Latent upscale is preserved.
+[ ] High-res branch is preserved.
+[ ] Native LTX 2.5 audio is preserved.
+[ ] Audio latent/lipsync path is preserved.
+[ ] Video/audio output is preserved.
+[ ] Generation uses batch frame processing.
+[ ] Latents are checkpointed to disk.
+[ ] Decoded frames are checkpointed to disk.
+[ ] Resume works.
+[ ] Automatic cleanup works.
+[ ] RAM monitoring works.
+[ ] GPU monitoring works.
+[ ] Tiled VAE decoding works.
+[ ] Model lifecycle is phase-isolated.
+[ ] Text encoders are unloaded before diffusion when possible.
+[ ] DiT is unloaded after generation batches.
+[ ] VAEs are unloaded after decode.
+[ ] No unnecessary model duplication occurs.
+[ ] OOM recovery is implemented.
+[ ] The code does not intentionally restart the Colab runtime.
+[ ] The pipeline does not hold the entire long video on GPU.
+[ ] The final MP4 is generated correctly.
+[ ] Audio/video synchronization is preserved.
+[ ] Metadata is saved.
+[ ] Errors are reported clearly.
+[ ] The final notebook is executable on Google Colab Tesla T4.
+
+============================================================
+MOST IMPORTANT REQUIREMENT
+============================================================
+
+PRIORITIZE RELIABILITY OVER SPEED.
+
+Never attempt to fit the entire LTX 2.5 All-In-One workflow into a Tesla T4's 15 GB VRAM simultaneously.
+
+Use:
+
+LOAD
+→ EXECUTE
+→ SAVE
+→ DELETE
+→ PURGE
+→ NEXT PHASE
+
+rather than:
+
+LOAD EVERYTHING
+→ GENERATE EVERYTHING
+→ DECODE EVERYTHING
+
+The final architecture must be OUT-OF-CORE.
+
+============================================================
+FINAL RESPONSE FORMAT
+============================================================
+
+After analyzing the JSON, provide:
+
+PART 1 — Complete workflow analysis
+
+PART 2 — Node/branch architecture
+
+PART 3 — Model/LoRA registry
+
+PART 4 — Memory architecture
+
+PART 5 — Colab execution architecture
+
+PART 6 — Complete Python notebook code
+
+PART 7 — Installation/model-download section
+
+PART 8 — Usage instructions
+
+PART 9 — T4 memory-safety explanation
+
+PART 10 — Known limitations / nodes requiring verification
+
+Do not omit code for major pipeline stages.
+
+Generate the complete implementation.
