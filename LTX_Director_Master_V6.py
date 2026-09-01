@@ -87,6 +87,11 @@ MODEL_REGISTRY = {
         "encoder_mode":  "single",
         "text_encoder":  ("gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
                           f"{_LTX_ROOT}/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors", True),
+        # GGUF-quantized encoder (Q5_K_M ~9.5GB) — stays quantized in VRAM, dequant
+        # per-op (जैसे DiT GGUF), इसलिए यह T4 (15.6GB) में fit हो सकता है जबकि 12GB
+        # int8 safetensors नहीं होता। gated → HF_TOKEN चाहिए। CLIPLoaderGGUF (city96) से load होता है।
+        "encoder_gguf":  ("gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf",
+                          f"{_LTX_ROOT}/elix3r/gemma4-12b-with-proj-ltx-2.5-GGUF/resolve/main/gemma4-12b-with-proj-ltx-2.5-Q5_K_M.gguf", True),
         "text_proj":     None,
         "clip_type":     "ltxv",
         # VAEs + upscaler: GATED on Lightricks/LTX-2.5 (no ungated mirror exists).
@@ -155,6 +160,7 @@ class TextEncoderOOM(RuntimeError):
 # सकता है। env LTX_STREAM_ENCODER=0/1 से force भी कर सकते हैं। (EXPERIMENTAL — यह तभी
 # काम करेगा जब activation memory भी छोटी हो; बहुत छोटे VRAM पर फिर भी OOM हो सकता है।)
 STREAM_ENCODER = False
+USE_GGUF_ENCODER = False
 if ACTIVE_FAMILY == "2.5":
     try:
         import torch as _t_early
@@ -169,17 +175,34 @@ if ACTIVE_FAMILY == "2.5":
     _env_se = _os_early.environ.get("LTX_STREAM_ENCODER")
     if _env_se is not None:
         STREAM_ENCODER = str(_env_se).strip().lower() not in ("0", "false", "no", "")
+
+    # 🧩 USE_GGUF_ENCODER: छोटे GPU पर 2.5 चलाने का असली रास्ता। int8 safetensors encoder
+    # (12GB) full-precision dequant माँगता है → T4 पर fit नहीं। पर GGUF encoder (Q5_K_M
+    # ~9.5GB) VRAM में quantized रहकर per-op dequant करता है (जैसे DiT GGUF) → 15.6GB T4
+    # में fit हो सकता है। gated file है, इसलिए HF_TOKEN ज़रूरी। CLIPLoaderGGUF (city96) से load।
+    # default: 2.5 + <24GB VRAM + token हो → ON। env LTX_GGUF_ENCODER=0/1 से override।
+    USE_GGUF_ENCODER = False
+    if MODELS.get("encoder_gguf"):
+        _env_ge = _os_early.environ.get("LTX_GGUF_ENCODER")
+        if _env_ge is not None:
+            USE_GGUF_ENCODER = str(_env_ge).strip().lower() not in ("0", "false", "no", "")
+        elif 0 < _vram_gb_early < 24.0 and HF_TOKEN:
+            USE_GGUF_ENCODER = True
+
     if 0 < _vram_gb_early < 24.0:
         print("=" * 70)
-        print(f"  ⛔ LTX-2.5 का Gemma-4 12B text-encoder ~24GB+ VRAM माँगता है "
+        print(f"  ⛔ LTX-2.5 का असली Gemma-4 12B encoder ~24GB+ VRAM माँगता है "
               f"(Lightricks official)। आपके GPU में ~{_vram_gb_early:.1f}GB है।")
-        print(f"  यह encoder न इस VRAM में पूरा आता है, न T4 की ~11GB host RAM में — इसलिए")
-        print(f"  encode step पर script इसे load करने से पहले ही साफ़ error देकर रुक जाएगी")
-        print(f"  (ताकि पिछली बार जैसा FATAL session-crash न हो)।")
-        print(f"  ✅ इस GPU पर काम करने के लिए: MODEL_FAMILY='2.3' (T4 पर पूरा चलता है)।")
-        print(f"  ✅ LTX-2.5 quality चाहिए तो: L4/A100 (24GB+) runtime इस्तेमाल करें।")
-        if STREAM_ENCODER:
-            print(f"  🌊 (आपने LTX_STREAM_ENCODER=1 forced किया है — जोखिम पर streaming कोशिश होगी।)")
+        if USE_GGUF_ENCODER:
+            print(f"  🧩 इसलिए छोटे GPU पर हम GGUF-quantized encoder (Q5_K_M ~9.5GB) इस्तेमाल")
+            print(f"     करेंगे — यह VRAM में quantized रहकर per-op dequant करता है (जैसे DiT")
+            print(f"     GGUF), इसलिए T4 में fit होने का अच्छा मौका है (EXPERIMENTAL)।")
+            print(f"     बंद करना हो: os.environ['LTX_GGUF_ENCODER']='0'।")
+        elif not HF_TOKEN:
+            print(f"  🧩 GGUF encoder (T4-fit) उपलब्ध है पर gated — HF_TOKEN चाहिए।")
+        else:
+            print(f"  यह encoder न VRAM में, न ~11GB host RAM में पूरा आता है — load से पहले रुकेंगे।")
+        print(f"  ✅ पक्का रास्ता: MODEL_FAMILY='2.3' (T4) या L4/A100 (24GB+) runtime।")
         print("=" * 70)
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -472,11 +495,16 @@ download_file(_DIT_GGUF_URL, os.path.join(MODELS_DIR, "unet"),
 link_file_safe(os.path.join(MODELS_DIR, "unet", DIT_GGUF_NAME),
                os.path.join(MODELS_DIR, "diffusion_models", DIT_GGUF_NAME))
 
-# Text encoder (+ optional separate projection for the 2.3 dual-clip path).
-_te = MODELS["text_encoder"]
+# Text encoder. On small GPUs for 2.5 we use the GGUF-quantized encoder (fits T4)
+# instead of the 12GB int8 safetensors (needs 24GB+). Otherwise the registry default.
+if globals().get("USE_GGUF_ENCODER", False) and MODELS.get("encoder_gguf"):
+    _te = MODELS["encoder_gguf"]
+    print(f"  🧩 Using GGUF encoder for LTX-{ACTIVE_FAMILY} on this GPU: {_te[0]}")
+else:
+    _te = MODELS["text_encoder"]
 _dl(_te, TE_DIR)
 link_file_safe(os.path.join(TE_DIR, _te[0]), os.path.join(CLIP_DIR, _te[0]))
-if MODELS.get("text_proj"):
+if (not globals().get("USE_GGUF_ENCODER", False)) and MODELS.get("text_proj"):
     _tp = MODELS["text_proj"]
     _dl(_tp, TE_DIR)
     link_file_safe(os.path.join(TE_DIR, _tp[0]), os.path.join(CLIP_DIR, _tp[0]))
@@ -2012,7 +2040,8 @@ def encode_prompt_on_gpu(prompt_text: str):
       • LTX-2.5 → "single": CLIPLoader (projection encoder में ही fused है — "with-proj")।
     दोनों में weights CUDA पर load होते हैं (host RAM spike न हो), encode के बाद purge।"""
     purge_deep("pre_clip_load")
-    _enc_name = MODELS["text_encoder"][0]
+    _use_gguf_enc = bool(globals().get("USE_GGUF_ENCODER", False)) and bool(MODELS.get("encoder_gguf"))
+    _enc_name = MODELS["encoder_gguf"][0] if _use_gguf_enc else MODELS["text_encoder"][0]
     _clip_type = MODELS.get("clip_type", "ltxv")
     _stream = bool(globals().get("STREAM_ENCODER", False))
 
@@ -2064,8 +2093,23 @@ def encode_prompt_on_gpu(prompt_text: str):
                   "stream कर रहे हैं — peak VRAM कम, पर धीमा (experimental)।")
         except Exception:
             pass
-    if MODELS.get("encoder_mode", "dual") == "single":
-        # LTX-2.5: single fused encoder.
+    if _use_gguf_enc:
+        # LTX-2.5 on small GPU: GGUF-quantized fused encoder via city96 CLIPLoaderGGUF.
+        # weights VRAM में quantized रहते हैं, per-op dequant → T4 में fit होने का मौका।
+        mem_report("Phase A", f"CLIPLoaderGGUF ({_enc_name}) on GPU")
+        import comfy.model_management as mm
+        if "CLIPLoaderGGUF" not in NODE_CLASS_MAPPINGS:
+            raise TextEncoderOOM(
+                "CLIPLoaderGGUF node नहीं मिला — GGUF encoder load नहीं कर सकते।\n"
+                "  ComfyUI_GGUF (city96) install जाँचें (Cell 4), या MODEL_FAMILY='2.3' इस्तेमाल करें।")
+        # city96 loaders type param लेते हैं (ltxv)। कुछ versions में सिर्फ़ clip_name।
+        try:
+            clip = gv(call_node("CLIPLoaderGGUF",
+                                clip_name=_enc_name, type=_clip_type), 0)
+        except Exception:
+            clip = gv(call_node("CLIPLoaderGGUF", clip_name=_enc_name), 0)
+    elif MODELS.get("encoder_mode", "dual") == "single":
+        # LTX-2.5: single fused encoder (full int8 safetensors — needs 24GB+ GPU).
         mem_report("Phase A", f"CLIPLoader ({_enc_name}) on GPU")
         import comfy.model_management as mm
         clip = gv(call_node("CLIPLoader",
