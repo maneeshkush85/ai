@@ -478,6 +478,20 @@ lora_dir  = "/content/ComfyUI/models/loras"
 _download_failures = []   # 🇮🇳 gated/failed downloads यहाँ जमा होते हैं (नीचे report)।
 
 
+def _hf_repo_page(url: str) -> str:
+    """🇮🇳 HF resolve-URL से उस repo का page URL निकालता है (license accept करने के लिए)।
+    e.g. https://huggingface.co/OWNER/REPO/resolve/main/... → https://huggingface.co/OWNER/REPO"""
+    try:
+        if "huggingface.co/" in url:
+            tail = url.split("huggingface.co/", 1)[1]
+            parts = tail.split("/")
+            if len(parts) >= 2:
+                return f"https://huggingface.co/{parts[0]}/{parts[1]}"
+    except Exception:
+        pass
+    return url
+
+
 def _dl(entry, dest_dir, filename=None):
     """registry entry (name,url,...,gated) → download_file, फ़ेल हुआ तो track करें।"""
     name = filename or entry[0]
@@ -485,13 +499,13 @@ def _dl(entry, dest_dir, filename=None):
     gated = bool(entry[-1])
     ok = download_file(url, dest_dir, filename=name, gated=gated)
     if ok is None:
-        _download_failures.append((name, gated))
+        _download_failures.append((name, gated, url))
     return ok
 
 
 # 🇮🇳 22B DiT model (quant registry/env से)।
 download_file(_DIT_GGUF_URL, os.path.join(MODELS_DIR, "unet"),
-              filename=DIT_GGUF_NAME, gated=_DIT_GGUF_GATED) or _download_failures.append((DIT_GGUF_NAME, _DIT_GGUF_GATED))
+              filename=DIT_GGUF_NAME, gated=_DIT_GGUF_GATED) or _download_failures.append((DIT_GGUF_NAME, _DIT_GGUF_GATED, _DIT_GGUF_URL))
 link_file_safe(os.path.join(MODELS_DIR, "unet", DIT_GGUF_NAME),
                os.path.join(MODELS_DIR, "diffusion_models", DIT_GGUF_NAME))
 
@@ -537,22 +551,39 @@ if not os.path.exists(audio_file_target) or os.path.getsize(audio_file_target) <
 # ── Download failure report ──────────────────────────────────────────────────
 # 🇮🇳 अगर कोई ज़रूरी (खासकर gated 2.5) file नहीं मिली तो साफ़ बताएँ और रोकें, ताकि
 # आधे-अधूरे models के साथ चलकर बाद में crash/garbage न हो।
-_gated_fail = [n for (n, g) in _download_failures if g]
-_other_fail = [n for (n, g) in _download_failures if not g]
+_gated_fail = [(n, u) for (n, g, u) in _download_failures if g]
+_other_fail = [n for (n, g, u) in _download_failures if not g]
 if _gated_fail:
+    # 🇮🇳 हर gated file के लिए उसका असली repo page दिखाओ — कई बार अलग-अलग repos होते
+    # हैं (VAE = Lightricks/LTX-2.5, पर GGUF encoder = elix3r/...)। हर एक पर अलग से
+    # "Agree and access" करना पड़ता है।
+    _repos_to_accept = sorted({_hf_repo_page(u) for (n, u) in _gated_fail})
     print("\n" + "=" * 70)
     print(f"  🔒 {len(_gated_fail)} GATED file(s) download नहीं हुईं (LTX-{ACTIVE_FAMILY}):")
-    for n in _gated_fail:
+    for n, u in _gated_fail:
         print(f"       • {n}")
-    print("  👉 इन्हें पाने के लिए: https://huggingface.co/Lightricks/LTX-2.5 पर जाकर")
-    print("     'Agree and access' करें, फिर token सेट करें:")
+        print(f"           से: {_hf_repo_page(u)}")
+    print("  👉 नीचे दिए हर repo page पर जाकर (login करके) 'Agree and access' दबाएँ")
+    print("     (आपके token के लिए per-repo एक-बार का काम है):")
+    for r in _repos_to_accept:
+        print(f"       ✅ {r}")
+    print("     फिर token सेट करके Cell 5 दोबारा चलाएँ:")
     print("        import os; os.environ['HF_TOKEN'] = 'hf_xxx'")
-    print("     और Cell 5 दोबारा चलाएँ। (LTX-2.5 के VAE/encoder इनके बिना नहीं चलेंगे।)")
     print("=" * 70)
     if ACTIVE_FAMILY == "2.5":
+        # 🇮🇳 अगर सिर्फ़ GGUF encoder gated-fail हुआ (VAE आदि आ गए), तो साफ़ बताओ कि
+        # बस उस एक elix3r repo को accept करना है — या GGUF encoder बंद करके बड़े GPU पर
+        # असली encoder इस्तेमाल करें।
+        _only_encoder_failed = all("gemma4" in n.lower() for (n, u) in _gated_fail)
+        if _only_encoder_failed and globals().get("USE_GGUF_ENCODER", False):
+            raise RuntimeError(
+                "LTX-2.5 GGUF encoder gated है और अभी access नहीं मिला। बस ऊपर दिखाए "
+                "elix3r repo पर 'Agree and access' करके दोबारा चलाएँ। "
+                "(विकल्प: os.environ['LTX_GGUF_ENCODER']='0' — पर तब असली 12B encoder T4 में fit नहीं होगा; "
+                "या MODEL_FAMILY='2.3'।)")
         raise RuntimeError(
-            "LTX-2.5 gated assets missing (need HF_TOKEN + accepted Lightricks/LTX-2.5 "
-            "license). Set HF_TOKEN and re-run, or set MODEL_FAMILY='2.3'.")
+            "LTX-2.5 gated assets missing. ऊपर दिखाए हर repo पर license accept करके "
+            "HF_TOKEN के साथ दोबारा चलाएँ, या MODEL_FAMILY='2.3' इस्तेमाल करें।")
 if _other_fail:
     print(f"  ⚠️  {len(_other_fail)} file(s) download नहीं हुईं: {', '.join(_other_fail)} — "
           f"network जाँचें और दोबारा चलाएँ।")
