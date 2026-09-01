@@ -162,22 +162,24 @@ if ACTIVE_FAMILY == "2.5":
                           if _t_early.cuda.is_available() else 0.0)
     except Exception:
         _vram_gb_early = 0.0
+    # 🇮🇳 streaming अब सिर्फ़ opt-in (default OFF)। कारण: T4 पर host RAM (~11GB) encoder
+    # (~12GB) से छोटी है, इसलिए CPU-stream करने पर encoder host RAM में materialize होकर
+    # पूरा session crash कर देता है (हमने यह empirically देखा)। इसलिए इसे अपने-आप ON नहीं
+    # करते; encode step का preflight वैसे भी सुरक्षित रूप से पहले ही रोक देगा।
     _env_se = _os_early.environ.get("LTX_STREAM_ENCODER")
     if _env_se is not None:
         STREAM_ENCODER = str(_env_se).strip().lower() not in ("0", "false", "no", "")
-    elif 0 < _vram_gb_early < 24.0:
-        STREAM_ENCODER = True    # छोटा GPU + 2.5 → default में streaming ON
     if 0 < _vram_gb_early < 24.0:
         print("=" * 70)
         print(f"  ⛔ LTX-2.5 का Gemma-4 12B text-encoder ~24GB+ VRAM माँगता है "
               f"(Lightricks official)। आपके GPU में ~{_vram_gb_early:.1f}GB है।")
+        print(f"  यह encoder न इस VRAM में पूरा आता है, न T4 की ~11GB host RAM में — इसलिए")
+        print(f"  encode step पर script इसे load करने से पहले ही साफ़ error देकर रुक जाएगी")
+        print(f"  (ताकि पिछली बार जैसा FATAL session-crash न हो)।")
+        print(f"  ✅ इस GPU पर काम करने के लिए: MODEL_FAMILY='2.3' (T4 पर पूरा चलता है)।")
+        print(f"  ✅ LTX-2.5 quality चाहिए तो: L4/A100 (24GB+) runtime इस्तेमाल करें।")
         if STREAM_ENCODER:
-            print(f"  🌊 STREAM_ENCODER ON → encoder को disk/CPU से layer-by-layer stream")
-            print(f"     करके चलाने की EXPERIMENTAL कोशिश करेंगे (धीमा; हो सकता है फिर भी OOM हो)।")
-            print(f"     बंद करना हो: os.environ['LTX_STREAM_ENCODER']='0'।")
-        else:
-            print(f"  encode step पर OOM की संभावना है।")
-        print(f"  ✅ पक्का काम करने के लिए: MODEL_FAMILY='2.3' (T4) या L4/A100 (24GB+) runtime।")
+            print(f"  🌊 (आपने LTX_STREAM_ENCODER=1 forced किया है — जोखिम पर streaming कोशिश होगी।)")
         print("=" * 70)
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2013,6 +2015,44 @@ def encode_prompt_on_gpu(prompt_text: str):
     _enc_name = MODELS["text_encoder"][0]
     _clip_type = MODELS.get("clip_type", "ltxv")
     _stream = bool(globals().get("STREAM_ENCODER", False))
+
+    # ── PREFLIGHT: क्या यह encoder इस hardware पर fit होगा? ────────────────────
+    # 🇮🇳 सबक (एक fatal session-crash से): 12B encoder को GPU पर पूरा रखो तो VRAM OOM
+    # (catchable), पर CPU/stream पर डालो तो वह पूरा HOST RAM में materialize होता है
+    # (comfy_kitchen int8 mmap-view नहीं रखता) → host RAM भर जाए तो पूरा kernel मर
+    # जाता है (session crash, uncatchable)। इसलिए load करने से पहले ही जाँच लें: अगर
+    # न GPU में fit है, न host RAM में — तो load की कोशिश ही मत करो, साफ़ error दो।
+    if MODELS.get("encoder_mode", "dual") == "single":   # सिर्फ़ 2.5-style बड़ा fused encoder
+        _forced = str(os.environ.get("LTX_FORCE_25_ENCODER", "0")).strip().lower() not in ("0", "false", "no", "")
+        _enc_path = os.path.join("/content/ComfyUI/models/text_encoders", _enc_name)
+        try:
+            _enc_gb = os.path.getsize(_enc_path) / 1e9
+        except Exception:
+            _enc_gb = 12.0
+        _vram_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9) if torch.cuda.is_available() else 0.0
+        _ram_free = get_ram_free_gb()
+        _gpu_ok = _vram_gb >= (_enc_gb + 3.0)          # पूरा encoder + dequant/activation headroom
+        _stream_ok = _stream and (_ram_free >= (_enc_gb + 2.0))   # CPU copy को host RAM में जगह
+        print(f"  🔎 Encoder preflight: file ~{_enc_gb:.1f}GB · VRAM ~{_vram_gb:.1f}GB · "
+              f"host RAM free ~{_ram_free:.1f}GB · gpu_fit={_gpu_ok} · stream_fit={_stream_ok}")
+        if not (_gpu_ok or _stream_ok or _forced):
+            raise TextEncoderOOM(
+                f"LTX-{ACTIVE_FAMILY} का text-encoder ({_enc_name}, ~{_enc_gb:.1f}GB) इस hardware पर "
+                f"fit नहीं होता:\n"
+                f"    • GPU पर पूरा रखने के लिए ~{_enc_gb+3.0:.0f}GB VRAM चाहिए, आपके पास ~{_vram_gb:.1f}GB।\n"
+                f"    • CPU/stream पर रखने के लिए ~{_enc_gb+2.0:.0f}GB free host RAM चाहिए, आपके पास ~{_ram_free:.1f}GB।\n"
+                f"  दोनों में से कोई पूरा नहीं पड़ता — इसलिए load की कोशिश नहीं की (वरना host-RAM भरकर "
+                f"पूरा session crash हो जाता, जैसा पिछली बार हुआ)।\n"
+                f"  ✅ इस GPU पर: MODEL_FAMILY='2.3' (T4 पर पूरा चलता है)।\n"
+                f"  ✅ LTX-2.5 चाहिए तो: L4/A100 (24GB+) runtime।\n"
+                f"  (जोखिम उठाकर फिर भी कोशिश करनी हो: os.environ['LTX_FORCE_25_ENCODER']='1' — "
+                f"पर यह session crash कर सकता है।)"
+            )
+        if _stream and not _stream_ok and not _forced:
+            # streaming माँगा पर host RAM कम → streaming बंद करो (वरना crash); GPU path पर जाओ
+            # (जहाँ कम-से-कम catchable OOM आएगा)। ऊपर _gpu_ok True था इसलिए यहाँ safe है।
+            print("  ⚠️ host RAM streaming के लिए कम है → streaming बंद, encoder GPU पर load होगा।")
+            _stream = False
     if _stream:
         # 🌊 encode के दौरान LOW_VRAM → comfy encoder layers को CPU/disk से stream करे।
         try:
