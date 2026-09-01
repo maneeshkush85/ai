@@ -149,6 +149,12 @@ class TextEncoderOOM(RuntimeError):
 # text-encoder चलाने के लिए ~24-27GB VRAM चाहिए (16GB पर भी नहीं चलता, FP8 के बाद भी)।
 # T4 (15GB) उससे छोटा है — इसलिए 2.5 का encoder T4 पर fit ही नहीं होता। यह चेतावनी
 # पहले ही दे देते हैं ताकि पता रहे कि क्यों encode step पर OOM आएगा।
+# 🌊 STREAM_ENCODER: LTX-2.5 का 12B encoder VRAM में पूरा नहीं आता। इसे ON करने पर
+# encoder को GPU पर पूरा रखने के बजाय layer-by-layer (CPU + disk-mmap-backed) stream
+# किया जाता है → peak VRAM बहुत कम (सिर्फ़ active layer)। धीमा पर छोटे GPU पर fit हो
+# सकता है। env LTX_STREAM_ENCODER=0/1 से force भी कर सकते हैं। (EXPERIMENTAL — यह तभी
+# काम करेगा जब activation memory भी छोटी हो; बहुत छोटे VRAM पर फिर भी OOM हो सकता है।)
+STREAM_ENCODER = False
 if ACTIVE_FAMILY == "2.5":
     try:
         import torch as _t_early
@@ -156,13 +162,22 @@ if ACTIVE_FAMILY == "2.5":
                           if _t_early.cuda.is_available() else 0.0)
     except Exception:
         _vram_gb_early = 0.0
+    _env_se = _os_early.environ.get("LTX_STREAM_ENCODER")
+    if _env_se is not None:
+        STREAM_ENCODER = str(_env_se).strip().lower() not in ("0", "false", "no", "")
+    elif 0 < _vram_gb_early < 24.0:
+        STREAM_ENCODER = True    # छोटा GPU + 2.5 → default में streaming ON
     if 0 < _vram_gb_early < 24.0:
         print("=" * 70)
-        print(f"  ⛔ चेतावनी: LTX-2.5 का Gemma-4 12B text-encoder ~24GB+ VRAM माँगता है")
-        print(f"     (Lightricks की official requirement)। आपके GPU में सिर्फ़ ~{_vram_gb_early:.1f}GB है।")
-        print(f"     encode step पर CUDA OOM लगभग तय है — यह hardware की सीमा है, code की नहीं।")
-        print(f"     ✅ इस GPU पर काम करने के लिए: MODEL_FAMILY='2.3' रखें।")
-        print(f"     ✅ LTX-2.5 चाहिए तो: L4/A100 (24GB+) runtime इस्तेमाल करें।")
+        print(f"  ⛔ LTX-2.5 का Gemma-4 12B text-encoder ~24GB+ VRAM माँगता है "
+              f"(Lightricks official)। आपके GPU में ~{_vram_gb_early:.1f}GB है।")
+        if STREAM_ENCODER:
+            print(f"  🌊 STREAM_ENCODER ON → encoder को disk/CPU से layer-by-layer stream")
+            print(f"     करके चलाने की EXPERIMENTAL कोशिश करेंगे (धीमा; हो सकता है फिर भी OOM हो)।")
+            print(f"     बंद करना हो: os.environ['LTX_STREAM_ENCODER']='0'।")
+        else:
+            print(f"  encode step पर OOM की संभावना है।")
+        print(f"  ✅ पक्का काम करने के लिए: MODEL_FAMILY='2.3' (T4) या L4/A100 (24GB+) runtime।")
         print("=" * 70)
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1131,14 +1146,27 @@ def patch_comfy_memory_manager():
             mm._ltx_patched = True
 
         if torch.cuda.is_available():
-            mm.text_encoder_device = lambda: torch.device("cuda")
-            mm.text_encoder_offload_device = lambda: torch.device("cuda")
+            if globals().get("STREAM_ENCODER", False):
+                # 🌊 STREAM: encoder GPU पर compute पर offload/park CPU पर → comfy का
+                # model_prefetch layers को CPU(disk-mmap)↔GPU stream करता है, पूरा 12B
+                # एक साथ VRAM में नहीं आता। (peak VRAM = ~active layer + activations)
+                mm.text_encoder_device = lambda: torch.device("cuda")
+                mm.text_encoder_offload_device = lambda: torch.device("cpu")
+            else:
+                # 2.3/normal: encoder पूरा GPU पर (host-RAM spike से बचने के लिए)।
+                mm.text_encoder_device = lambda: torch.device("cuda")
+                mm.text_encoder_offload_device = lambda: torch.device("cuda")
     except Exception as e:
         print(f"  [mem-patch notice] {e}")
 
 
 def patch_safetensors_direct_to_gpu():
-    """Load text-encoder shards straight onto CUDA so host RAM never spikes."""
+    """Load text-encoder shards straight onto CUDA so host RAM never spikes.
+
+    🌊 STREAM_ENCODER mode: encoder को CUDA पर सीधे load NA करें — CPU पर mmap रहने दें
+    (safetensors डिफ़ॉल्ट रूप से file को memory-map करता है, यानी weights disk-backed
+    page-cache में रहते हैं, न पूरे host RAM में न VRAM में)। तब comfy layer-by-layer
+    GPU पर stream करता है।"""
     try:
         import safetensors.torch as st
         if not getattr(st, "_ltx_cuda_direct", False):
@@ -1146,9 +1174,11 @@ def patch_safetensors_direct_to_gpu():
 
             def _cuda_load(filename, device="cpu"):
                 fn = str(filename).lower()
-                if torch.cuda.is_available() and any(k in fn for k in
-                        ["gemma", "clip", "text_encoder", "projection", "connector"]):
+                _is_te = any(k in fn for k in
+                             ["gemma", "clip", "text_encoder", "projection", "connector"])
+                if (not globals().get("STREAM_ENCODER", False)) and torch.cuda.is_available() and _is_te:
                     return _orig(filename, device="cuda")
+                # streaming (or non-TE): CPU/mmap — disk-backed, कम RAM व VRAM।
                 return _orig(filename, device=device)
             st.load_file = _cuda_load
             st._ltx_cuda_direct = True
@@ -1982,6 +2012,18 @@ def encode_prompt_on_gpu(prompt_text: str):
     purge_deep("pre_clip_load")
     _enc_name = MODELS["text_encoder"][0]
     _clip_type = MODELS.get("clip_type", "ltxv")
+    _stream = bool(globals().get("STREAM_ENCODER", False))
+    if _stream:
+        # 🌊 encode के दौरान LOW_VRAM → comfy encoder layers को CPU/disk से stream करे।
+        try:
+            import comfy.model_management as mm
+            _vs = getattr(mm, "VRAMState", None)
+            if _vs is not None:
+                mm.vram_state = _vs.LOW_VRAM
+            print("  🌊 STREAM_ENCODER: LOW_VRAM में encoder layer-by-layer (CPU/disk-backed) "
+                  "stream कर रहे हैं — peak VRAM कम, पर धीमा (experimental)।")
+        except Exception:
+            pass
     if MODELS.get("encoder_mode", "dual") == "single":
         # LTX-2.5: single fused encoder.
         mem_report("Phase A", f"CLIPLoader ({_enc_name}) on GPU")
@@ -2045,7 +2087,13 @@ def encode_prompt_on_gpu(prompt_text: str):
         torch.cuda.ipc_collect()
     drop_os_page_cache()
     malloc_trim_os()
-    mem_report("Phase A", "Gemma weights purged (tokenizer kept)")
+    if _stream:
+        # 🌊 encoder हो गया → DiT के लिए VRAM_MODE (आमतौर पर normalvram) पर वापस।
+        try:
+            configure_vram_state(str(globals().get("VRAM_MODE", "normalvram")))
+        except Exception:
+            pass
+    mem_report("Phase A", "Encoder weights purged (tokenizer kept)")
     return cond_cpu, saved_tokenizer
 
 
