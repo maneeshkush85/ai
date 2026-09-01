@@ -137,6 +137,34 @@ ACTIVE_FAMILY = _resolve_model_family()
 MODELS = MODEL_REGISTRY[ACTIVE_FAMILY]
 print(f"🧬 Model family = LTX-{ACTIVE_FAMILY}  ·  {MODELS['label']}")
 
+
+class TextEncoderOOM(RuntimeError):
+    """🇮🇳 सिर्फ़ text-encoder (prompt encode) के समय VRAM खत्म होने पर। यह
+    resolution-independent है — इसलिए resolution घटाने वाला OOM-retry ladder इसे
+    नहीं पकड़ता (वरना बेकार में 4 बार retry होता है, जैसा LTX-2.5 12B encoder पर हुआ)।"""
+    pass
+
+
+# ⚠️ LTX-2.5 hard wall: Lightricks का अपना कहना है कि LTX-2 / LTX-2.5 का Gemma-4 12B
+# text-encoder चलाने के लिए ~24-27GB VRAM चाहिए (16GB पर भी नहीं चलता, FP8 के बाद भी)।
+# T4 (15GB) उससे छोटा है — इसलिए 2.5 का encoder T4 पर fit ही नहीं होता। यह चेतावनी
+# पहले ही दे देते हैं ताकि पता रहे कि क्यों encode step पर OOM आएगा।
+if ACTIVE_FAMILY == "2.5":
+    try:
+        import torch as _t_early
+        _vram_gb_early = (_t_early.cuda.get_device_properties(0).total_memory / 1e9
+                          if _t_early.cuda.is_available() else 0.0)
+    except Exception:
+        _vram_gb_early = 0.0
+    if 0 < _vram_gb_early < 24.0:
+        print("=" * 70)
+        print(f"  ⛔ चेतावनी: LTX-2.5 का Gemma-4 12B text-encoder ~24GB+ VRAM माँगता है")
+        print(f"     (Lightricks की official requirement)। आपके GPU में सिर्फ़ ~{_vram_gb_early:.1f}GB है।")
+        print(f"     encode step पर CUDA OOM लगभग तय है — यह hardware की सीमा है, code की नहीं।")
+        print(f"     ✅ इस GPU पर काम करने के लिए: MODEL_FAMILY='2.3' रखें।")
+        print(f"     ✅ LTX-2.5 चाहिए तो: L4/A100 (24GB+) runtime इस्तेमाल करें।")
+        print("=" * 70)
+
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 1: ENVIRONMENT SETUP & MEMORY PROTECTION  (no swap — Colab blocks it)
 # 🇮🇳 CELL 1 का काम: Python environment तैयार करना और memory settings लगाना।
@@ -1972,11 +2000,30 @@ def encode_prompt_on_gpu(prompt_text: str):
 
     print("  ⚡ Encoding global prompt on GPU...")
     t0 = time.time()
-    with torch.inference_mode():
-        cond_raw = gv(call_node("CLIPTextEncode", text=prompt_text, clip=clip), 0)
-        cond_cpu = sync_cond_to_cpu(cond_raw)
-        del cond_raw
-    print(f"  ✓ Prompt encoded in {time.time() - t0:.2f}s. Purging Gemma-12B weights...")
+    try:
+        with torch.inference_mode():
+            cond_raw = gv(call_node("CLIPTextEncode", text=prompt_text, clip=clip), 0)
+            cond_cpu = sync_cond_to_cpu(cond_raw)
+            del cond_raw
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
+        if "out of memory" not in str(_e).lower():
+            raise
+        # 🇮🇳 encoder OOM — resolution घटाने से कोई फ़ायदा नहीं (encoder res-independent है)।
+        try:
+            del clip
+        except Exception:
+            pass
+        purge_deep("encoder_oom")
+        _vg = (torch.cuda.get_device_properties(0).total_memory / 1e9
+               if torch.cuda.is_available() else 0.0)
+        raise TextEncoderOOM(
+            f"Text-encoder ({_enc_name}) VRAM में fit नहीं हुआ (GPU ~{_vg:.1f}GB)।\n"
+            f"  LTX-{ACTIVE_FAMILY} का 12B Gemma-4 encoder ~24-27GB VRAM माँगता है "
+            f"(Lightricks की official requirement) — T4/16GB पर यह चलता ही नहीं।\n"
+            f"  👉 इस GPU पर: MODEL_FAMILY='2.3' इस्तेमाल करें (वह T4 पर पूरा चलता है)।\n"
+            f"  👉 LTX-2.5 चाहिए तो: L4/A100 (24GB+) runtime लें।"
+        ) from _e
+    print(f"  ✓ Prompt encoded in {time.time() - t0:.2f}s. Purging encoder weights...")
 
     try:
         clip.cond_stage_model = None
@@ -2775,6 +2822,11 @@ def run_ltx23_director_master(global_prompt, negative_prompt, meta, segments,
             del director_state, patched_model
             purge_deep("post_phase_b_master")
             break                       # ✅ हो गया
+        except TextEncoderOOM as e:
+            # 🇮🇳 encoder OOM — resolution retry बेकार है (यही LTX-2.5 12B encoder की
+            # असली दिक्कत है)। इसलिए तुरंत साफ़ guidance देकर रुक जाते हैं।
+            purge_deep("text_encoder_oom_abort")
+            raise
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if "out of memory" not in str(e).lower():
                 raise               # OOM नहीं है → असली error, आगे भेजो
