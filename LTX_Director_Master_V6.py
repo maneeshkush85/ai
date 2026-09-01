@@ -2259,6 +2259,16 @@ def encode_prompt_on_gpu(prompt_text: str):
                     "CLIPLoaderGGUF node नहीं मिला — GGUF encoder load नहीं कर सकते।\n"
                     "  ComfyUI_GGUF (city96) install जाँचें (Cell 4), या MODEL_FAMILY='2.3'।")
             patch_gguf_gemma4_as_gemma3()   # 🩹 'gemma4' arch → 'gemma3'
+            # 🔧 fp16 encoder: T4 पर ComfyUI यह encoder fp32 में चलाता है → forward
+            # activations दुगनी VRAM लेती हैं। fp16 पर मजबूर करने से peak लगभग आधा हो
+            # जाता है — यही 5.67GB free में fit होने का सबसे अच्छा मौका है। T4 fp16 सपोर्ट
+            # करता है। बंद करना हो: os.environ['LTX_ENCODER_FP16']='0'।
+            if str(os.environ.get("LTX_ENCODER_FP16", "1")).strip().lower() not in ("0", "false", "no"):
+                try:
+                    mm.text_encoder_dtype = lambda *a, **k: torch.float16
+                    print("  🔧 Encoder compute dtype → fp16 (forward VRAM ~आधा; T4-safe)।")
+                except Exception:
+                    pass
             try:
                 clip = gv(call_node("CLIPLoaderGGUF", clip_name=_enc_name, type=_clip_type), 0)
             except TypeError:
