@@ -2204,6 +2204,21 @@ def encode_prompt_on_gpu(prompt_text: str):
                             type=_clip_type, device="default"), 0)
     saved_tokenizer = getattr(clip, "tokenizer", None)
 
+    # 🧹 DEFRAG before encode: GGUF encoder load leaves ~1GB "reserved but unallocated"
+    # in PyTorch's cache. The token-embedding dequant needs a big (~1.9GB) block; on a
+    # 15.6GB T4 that ~1GB is the difference between OOM and success. Return it to the
+    # driver right before the forward so the big contiguous alloc can succeed.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    malloc_trim_os()
+    try:
+        _fg = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
+        print(f"  🧹 Pre-encode VRAM defrag → {_fg:.2f} GB free for the embedding dequant.")
+    except Exception:
+        pass
+
     print("  ⚡ Encoding global prompt on GPU...")
     t0 = time.time()
     try:
@@ -2222,12 +2237,21 @@ def encode_prompt_on_gpu(prompt_text: str):
         purge_deep("encoder_oom")
         _vg = (torch.cuda.get_device_properties(0).total_memory / 1e9
                if torch.cuda.is_available() else 0.0)
+        if _use_gguf_enc:
+            raise TextEncoderOOM(
+                f"GGUF encoder ({_enc_name}) load तो हुआ पर encode के दौरान VRAM कुछ ही "
+                f"MB से कम पड़ गया (GPU ~{_vg:.1f}GB)।\n"
+                f"  यानी हम बहुत करीब हैं — token-embedding dequant का बड़ा block नहीं समा पाया।\n"
+                f"  👉 कोशिश करें: (1) यही cell दोबारा चलाएँ (fresh VRAM), (2) कोई और GPU-process\n"
+                f"     बंद करें, (3) छोटा quant मिले तो इस्तेमाल करें, या (4) L4/A100 runtime लें।\n"
+                f"  👉 पक्का चलने के लिए इस T4 पर: MODEL_FAMILY='2.3'।"
+            ) from _e
         raise TextEncoderOOM(
             f"Text-encoder ({_enc_name}) VRAM में fit नहीं हुआ (GPU ~{_vg:.1f}GB)।\n"
-            f"  LTX-{ACTIVE_FAMILY} का 12B Gemma-4 encoder ~24-27GB VRAM माँगता है "
+            f"  LTX-{ACTIVE_FAMILY} का असली 12B Gemma-4 int8 encoder ~24-27GB VRAM माँगता है "
             f"(Lightricks की official requirement) — T4/16GB पर यह चलता ही नहीं।\n"
-            f"  👉 इस GPU पर: MODEL_FAMILY='2.3' इस्तेमाल करें (वह T4 पर पूरा चलता है)।\n"
-            f"  👉 LTX-2.5 चाहिए तो: L4/A100 (24GB+) runtime लें।"
+            f"  👉 छोटे GPU पर GGUF encoder आज़माएँ: os.environ['LTX_GGUF_ENCODER']='1' (+उस repo को accept करें)।\n"
+            f"  👉 इस GPU पर पक्का: MODEL_FAMILY='2.3'। या LTX-2.5 के लिए L4/A100 (24GB+)।"
         ) from _e
     print(f"  ✓ Prompt encoded in {time.time() - t0:.2f}s. Purging encoder weights...")
 
