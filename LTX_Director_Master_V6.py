@@ -1247,6 +1247,53 @@ def patch_safetensors_direct_to_gpu():
         pass
 
 
+def patch_gguf_gemma4_as_gemma3() -> bool:
+    """🩹 EXPERIMENTAL: city96 ComfyUI-GGUF अभी 'gemma4' arch नहीं पहचानता (न main, न
+    elix3r-pinned commit) — सिर्फ़ 'gemma3'। LTX-2.5 का GGUF encoder arch='gemma4' है।
+    Gemma-4/3 tensor-convention लगभग एक जैसी है, इसलिए हम loader के get_field को patch
+    करके GGUF की arch metadata 'gemma4' को 'gemma3' बता देते हैं → पूरा loader gemma3
+    वाला रास्ता (tensor remap + norm correction + tokenizer) लगा देता है।
+
+    ⚠️ यह अनुमान (heuristic) है: अगर gemma4 का layout gemma3 से अलग हुआ तो या तो key
+    mismatch पर error आएगा (साफ़ पकड़ में), या (कम संभावना) conditioning थोड़ी गलत बनेगी।
+    सही/guaranteed नतीजे के लिए असली int8 encoder + 24GB+ GPU ही तरीका है।"""
+    try:
+        import sys as _sys
+        target = None
+        for _name, _mod in list(_sys.modules.items()):
+            if _mod is None:
+                continue
+            if (hasattr(_mod, "gguf_sd_loader") and hasattr(_mod, "get_field")
+                    and hasattr(_mod, "TXT_ARCH_LIST")):
+                _f = getattr(_mod, "__file__", "") or ""
+                if "gguf" in (_name.lower() + _f.lower()):
+                    target = _mod
+                    break
+        if target is None:
+            print("  [gguf-patch notice] ComfyUI-GGUF loader module नहीं मिला (अभी load नहीं हुआ?)।")
+            return False
+        if getattr(target, "_ltx_gemma4_patched", False):
+            return True
+        _orig_gf = target.get_field
+
+        def _gf(reader, field_name, field_type):
+            val = _orig_gf(reader, field_name, field_type)
+            if field_name == "general.architecture" and val == "gemma4":
+                return "gemma3"
+            return val
+        target.get_field = _gf
+        try:
+            target.TXT_ARCH_LIST.add("gemma3")
+        except Exception:
+            pass
+        target._ltx_gemma4_patched = True
+        print("  🩹 ComfyUI-GGUF patched: GGUF arch 'gemma4' → 'gemma3' के रूप में load (experimental)।")
+        return True
+    except Exception as e:
+        print(f"  [gguf-patch notice] {e}")
+        return False
+
+
 def drop_os_page_cache():
     patterns = [
         "/content/ComfyUI/models/unet/*.gguf",
@@ -2133,6 +2180,8 @@ def encode_prompt_on_gpu(prompt_text: str):
             raise TextEncoderOOM(
                 "CLIPLoaderGGUF node नहीं मिला — GGUF encoder load नहीं कर सकते।\n"
                 "  ComfyUI_GGUF (city96) install जाँचें (Cell 4), या MODEL_FAMILY='2.3' इस्तेमाल करें।")
+        # 🩹 city96 GGUF को 'gemma4' arch पढ़ना नहीं आता → gemma3 के रूप में treat कराएँ।
+        patch_gguf_gemma4_as_gemma3()
         # city96 loaders type param लेते हैं (ltxv)। कुछ versions में सिर्फ़ clip_name।
         try:
             clip = gv(call_node("CLIPLoaderGGUF",
