@@ -1369,6 +1369,65 @@ def free_models_no_cpu_offload(tag: str = ""):
     malloc_trim_os()
 
 
+def free_clip_hard(clip_obj=None, tag: str = ""):
+    """🧹 CLIP/text-encoder (खासकर GGUF) को VRAM से पूरी तरह हटाने का सबसे मज़बूत तरीका।
+
+    🇮🇳 GGUF CLIP के weights custom tensor-subclass में होते हैं और ComfyUI के
+    loaded-models cache में registered रहते हैं। अगर load/encode बीच में OOM कर जाए,
+    तो सिर्फ़ empty_cache() से VRAM खाली नहीं होती — model reference कहीं (cache या
+    Python frame) में ज़िंदा रहता है। यह function उन सब जगहों से reference हटाता है
+    फिर VRAM reclaim करता है। clip_obj=None भी दे सकते हैं (सिर्फ़ deep purge के लिए)।"""
+    # 1) दिए गए clip object के भारी हिस्से तोड़ो।
+    try:
+        if clip_obj is not None:
+            for _attr in ("cond_stage_model", "patcher", "cond_stage_model_options",
+                          "tokenizer", "transformer"):
+                try:
+                    setattr(clip_obj, _attr, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # 2) ComfyUI के loaded-models cache से सब हटाओ (यहीं GGUF clip register होता है)।
+    try:
+        import comfy.model_management as mm
+        for _lst in ("current_loaded_models",):
+            _v = getattr(mm, _lst, None)
+            if isinstance(_v, list):
+                _v.clear()
+        try:
+            mm.unload_all_models()
+        except Exception:
+            pass
+        try:
+            mm.cleanup_models()
+        except Exception:
+            pass
+        try:
+            mm.soft_empty_cache()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # 3) references तोड़ो + gc + VRAM reclaim।
+    try:
+        del clip_obj
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+    malloc_trim_os()
+    try:
+        _al = (torch.cuda.memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
+        _fg = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
+        print(f"  🧹 free_clip_hard({tag}): VRAM alloc {_al:.2f} GB · free {_fg:.2f} GB")
+    except Exception:
+        pass
+
+
 def ram_guard(min_free_gb: float = 2.0, tag: str = ""):
     if get_ram_free_gb() < min_free_gb:
         print(f"  ⚠️ [RAM GUARD] Free RAM {get_ram_free_gb():.2f} GB < {min_free_gb} GB → deep purge")
@@ -2171,57 +2230,66 @@ def encode_prompt_on_gpu(prompt_text: str):
                   "stream कर रहे हैं — peak VRAM कम, पर धीमा (experimental)।")
         except Exception:
             pass
-    if _use_gguf_enc:
-        # LTX-2.5 on small GPU: GGUF-quantized fused encoder via city96 CLIPLoaderGGUF.
-        # weights VRAM में quantized रहते हैं, per-op dequant → T4 में fit होने का मौका।
-        mem_report("Phase A", f"CLIPLoaderGGUF ({_enc_name}) on GPU")
-        import comfy.model_management as mm
-        if "CLIPLoaderGGUF" not in NODE_CLASS_MAPPINGS:
-            raise TextEncoderOOM(
-                "CLIPLoaderGGUF node नहीं मिला — GGUF encoder load नहीं कर सकते।\n"
-                "  ComfyUI_GGUF (city96) install जाँचें (Cell 4), या MODEL_FAMILY='2.3' इस्तेमाल करें।")
-        # 🩹 city96 GGUF को 'gemma4' arch पढ़ना नहीं आता → gemma3 के रूप में treat कराएँ।
-        patch_gguf_gemma4_as_gemma3()
-        # city96 loaders type param लेते हैं (ltxv)। कुछ versions में सिर्फ़ clip_name।
-        try:
-            clip = gv(call_node("CLIPLoaderGGUF",
-                                clip_name=_enc_name, type=_clip_type), 0)
-        except Exception:
-            clip = gv(call_node("CLIPLoaderGGUF", clip_name=_enc_name), 0)
-    elif MODELS.get("encoder_mode", "dual") == "single":
-        # LTX-2.5: single fused encoder (full int8 safetensors — needs 24GB+ GPU).
-        mem_report("Phase A", f"CLIPLoader ({_enc_name}) on GPU")
-        import comfy.model_management as mm
-        clip = gv(call_node("CLIPLoader",
-                            clip_name=_enc_name, type=_clip_type, device="default"), 0)
-    else:
-        # LTX-2.3: Gemma + separate projection.
-        mem_report("Phase A", f"DualCLIPLoader ({_enc_name} + projection) on GPU")
-        import comfy.model_management as mm
-        clip = gv(call_node("DualCLIPLoader",
-                            clip_name1=_enc_name,
-                            clip_name2=(MODELS["text_proj"][0] if MODELS.get("text_proj") else _enc_name),
-                            type=_clip_type, device="default"), 0)
-    saved_tokenizer = getattr(clip, "tokenizer", None)
-
-    # 🧹 DEFRAG before encode: GGUF encoder load leaves ~1GB "reserved but unallocated"
-    # in PyTorch's cache. The token-embedding dequant needs a big (~1.9GB) block; on a
-    # 15.6GB T4 that ~1GB is the difference between OOM and success. Return it to the
-    # driver right before the forward so the big contiguous alloc can succeed.
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    malloc_trim_os()
+    import comfy.model_management as mm
+    # 🧹 LOAD से पहले पक्का करो कि VRAM साफ़ है। अगर पिछले (failed) attempt/run का
+    # encoder अब भी VRAM में पड़ा है तो पहले उसे हटाओ — वरना नया load तुरंत OOM करेगा
+    # (यही "memory clearing not working" वाली दिक्कत थी)।
+    free_clip_hard(None, "pre_encoder_load")
     try:
-        _fg = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
-        print(f"  🧹 Pre-encode VRAM defrag → {_fg:.2f} GB free for the embedding dequant.")
+        _al0 = (torch.cuda.memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
+        if _al0 > 1.5:
+            print(f"  ⚠️ Load से पहले VRAM में {_al0:.2f} GB पहले से भरा है (पिछले run का बचा हुआ?) "
+                  f"— और साफ़ करने की कोशिश।")
+            free_clip_hard(None, "pre_encoder_load_2")
     except Exception:
         pass
 
-    print("  ⚡ Encoding global prompt on GPU...")
+    clip = None
+    saved_tokenizer = None
     t0 = time.time()
+    # 🇮🇳 पूरा encoder LOAD + ENCODE एक ही try में — ताकि किसी भी जगह OOM आए तो उसे
+    # यहीं पकड़कर पूरी तरह free किया जाए और साफ़ TextEncoderOOM raise हो (resolution
+    # ladder को नहीं भेजा जाए, क्योंकि encoder resolution-independent है)।
     try:
+        if _use_gguf_enc:
+            # LTX-2.5 small GPU: GGUF fused encoder (city96 CLIPLoaderGGUF), quantized in VRAM.
+            mem_report("Phase A", f"CLIPLoaderGGUF ({_enc_name}) on GPU")
+            if "CLIPLoaderGGUF" not in NODE_CLASS_MAPPINGS:
+                raise TextEncoderOOM(
+                    "CLIPLoaderGGUF node नहीं मिला — GGUF encoder load नहीं कर सकते।\n"
+                    "  ComfyUI_GGUF (city96) install जाँचें (Cell 4), या MODEL_FAMILY='2.3'।")
+            patch_gguf_gemma4_as_gemma3()   # 🩹 'gemma4' arch → 'gemma3'
+            try:
+                clip = gv(call_node("CLIPLoaderGGUF", clip_name=_enc_name, type=_clip_type), 0)
+            except TypeError:
+                clip = gv(call_node("CLIPLoaderGGUF", clip_name=_enc_name), 0)
+        elif MODELS.get("encoder_mode", "dual") == "single":
+            mem_report("Phase A", f"CLIPLoader ({_enc_name}) on GPU")
+            clip = gv(call_node("CLIPLoader",
+                                clip_name=_enc_name, type=_clip_type, device="default"), 0)
+        else:
+            mem_report("Phase A", f"DualCLIPLoader ({_enc_name} + projection) on GPU")
+            clip = gv(call_node("DualCLIPLoader",
+                                clip_name1=_enc_name,
+                                clip_name2=(MODELS["text_proj"][0] if MODELS.get("text_proj") else _enc_name),
+                                type=_clip_type, device="default"), 0)
+        saved_tokenizer = getattr(clip, "tokenizer", None)
+
+        # 🧹 DEFRAG before encode: load leaves ~1GB "reserved but unallocated". The
+        # token-embedding dequant needs a big (~1.9GB) block; return the cache to the
+        # driver so that contiguous alloc can succeed.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        malloc_trim_os()
+        try:
+            _fg = (torch.cuda.mem_get_info()[0] / 1e9) if torch.cuda.is_available() else 0.0
+            print(f"  🧹 Pre-encode VRAM defrag → {_fg:.2f} GB free for the embedding dequant.")
+        except Exception:
+            pass
+
+        print("  ⚡ Encoding global prompt on GPU...")
         with torch.inference_mode():
             cond_raw = gv(call_node("CLIPTextEncode", text=prompt_text, clip=clip), 0)
             cond_cpu = sync_cond_to_cpu(cond_raw)
@@ -2229,30 +2297,29 @@ def encode_prompt_on_gpu(prompt_text: str):
     except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
         if "out of memory" not in str(_e).lower():
             raise
-        # 🇮🇳 encoder OOM — resolution घटाने से कोई फ़ायदा नहीं (encoder res-independent है)।
-        try:
-            del clip
-        except Exception:
-            pass
-        purge_deep("encoder_oom")
+        # 🇮🇳 encoder LOAD या ENCODE कहीं भी OOM → यहीं सब कुछ HARD free करो और
+        # traceback-chain तोड़कर (from None) साफ़ TextEncoderOOM raise करो। from None
+        # ज़रूरी है: वरना बड़ा OOM traceback frame-locals (जैसे 9.5GB model) को ज़िंदा
+        # रखता है और VRAM कभी खाली नहीं होती (यही bug था)।
+        free_clip_hard(clip, "encoder_oom")
+        clip = None
         _vg = (torch.cuda.get_device_properties(0).total_memory / 1e9
                if torch.cuda.is_available() else 0.0)
         if _use_gguf_enc:
-            raise TextEncoderOOM(
-                f"GGUF encoder ({_enc_name}) load तो हुआ पर encode के दौरान VRAM कुछ ही "
-                f"MB से कम पड़ गया (GPU ~{_vg:.1f}GB)।\n"
-                f"  यानी हम बहुत करीब हैं — token-embedding dequant का बड़ा block नहीं समा पाया।\n"
-                f"  👉 कोशिश करें: (1) यही cell दोबारा चलाएँ (fresh VRAM), (2) कोई और GPU-process\n"
-                f"     बंद करें, (3) छोटा quant मिले तो इस्तेमाल करें, या (4) L4/A100 runtime लें।\n"
-                f"  👉 पक्का चलने के लिए इस T4 पर: MODEL_FAMILY='2.3'।"
-            ) from _e
-        raise TextEncoderOOM(
-            f"Text-encoder ({_enc_name}) VRAM में fit नहीं हुआ (GPU ~{_vg:.1f}GB)।\n"
-            f"  LTX-{ACTIVE_FAMILY} का असली 12B Gemma-4 int8 encoder ~24-27GB VRAM माँगता है "
-            f"(Lightricks की official requirement) — T4/16GB पर यह चलता ही नहीं।\n"
-            f"  👉 छोटे GPU पर GGUF encoder आज़माएँ: os.environ['LTX_GGUF_ENCODER']='1' (+उस repo को accept करें)।\n"
-            f"  👉 इस GPU पर पक्का: MODEL_FAMILY='2.3'। या LTX-2.5 के लिए L4/A100 (24GB+)।"
-        ) from _e
+            _msg = (
+                f"GGUF encoder ({_enc_name}) इस T4 (~{_vg:.1f}GB) पर VRAM में fit नहीं हुआ।\n"
+                f"  ⚠️ ज़रूरी: यह cell दोबारा चलाने से पहले RUNTIME RESTART करें "
+                f"(Runtime → Restart session)। बिना restart के पिछले attempt का ~9.5GB "
+                f"encoder VRAM में पड़ा रहता है और अगला load तुरंत OOM करता है।\n"
+                f"  fresh kernel में यह ~0.5GB से चूकता है — तब भी न चले तो MODEL_FAMILY='2.3' "
+                f"(T4 पर पक्का) या L4/A100 (24GB+) इस्तेमाल करें।")
+        else:
+            _msg = (
+                f"Text-encoder ({_enc_name}) VRAM में fit नहीं हुआ (GPU ~{_vg:.1f}GB)।\n"
+                f"  असली 12B int8 encoder ~24-27GB VRAM माँगता है — T4 पर नहीं चलता।\n"
+                f"  👉 os.environ['LTX_GGUF_ENCODER']='1' (GGUF encoder) आज़माएँ, या "
+                f"MODEL_FAMILY='2.3', या L4/A100 (24GB+)।")
+        raise TextEncoderOOM(_msg) from None
     print(f"  ✓ Prompt encoded in {time.time() - t0:.2f}s. Purging encoder weights...")
 
     try:
@@ -3059,21 +3126,29 @@ def run_ltx23_director_master(global_prompt, negative_prompt, meta, segments,
             purge_deep("post_phase_b_master")
             break                       # ✅ हो गया
         except TextEncoderOOM as e:
-            # 🇮🇳 encoder OOM — resolution retry बेकार है (यही LTX-2.5 12B encoder की
-            # असली दिक्कत है)। इसलिए तुरंत साफ़ guidance देकर रुक जाते हैं।
-            purge_deep("text_encoder_oom_abort")
-            raise
+            # 🇮🇳 encoder OOM (load या encode) — resolution retry बेकार है। HARD free
+            # करके साफ़ guidance के साथ रुक जाओ। msg अलग रख लो ताकि raise के बाद
+            # exception-object (जो frames को ज़िंदा रखता है) को drop कर सकें।
+            _te_msg = str(e)
+            del e                       # traceback/frame-locals (model refs) छोड़ो
+            free_clip_hard(None, "text_encoder_oom_abort")
+            raise TextEncoderOOM(_te_msg) from None
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            if "out of memory" not in str(e).lower():
+            _is_oom = "out of memory" in str(e).lower()
+            del e                       # 🧹 ज़रूरी: exception traceback frame-locals
+                                        # (जैसे आधा-load हुआ model) को तुरंत release करो,
+                                        # वरना अगले attempt तक VRAM में पड़े रहते हैं।
+            if not _is_oom:
                 raise               # OOM नहीं है → असली error, आगे भेजो
             attempt += 1
+            free_clip_hard(None, f"oom_retry_{attempt}")
             purge_deep(f"oom_retry_{attempt}")
             if attempt > MAX_OOM_RETRIES:
                 raise RuntimeError(
                     "CUDA OOM: resolution घटाने के बाद भी यह GPU पूरी continuous timeline "
                     "नहीं बना पाया।\n"
                     "  👉 render_seconds और घटाएँ, या L4/A100 runtime इस्तेमाल करें।"
-                ) from e
+                ) from None
             active_meta = _scale_meta_resolution(base_meta, 0.8 ** attempt)
             log(f"OOM #{attempt}: resolution घटाकर दोबारा कोशिश → "
                 f"{active_meta['generation_width']}x{active_meta['generation_height']} "
