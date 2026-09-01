@@ -2289,9 +2289,24 @@ def encode_prompt_on_gpu(prompt_text: str):
         except Exception:
             pass
 
+        # 🧠 OPTIONAL prompt trim (last VRAM lever for the GGUF encoder on tiny GPUs):
+        # encoder की forward activations sequence-length के साथ बढ़ती हैं। बहुत लंबे
+        # prompt पर peak VRAM ज़्यादा। env LTX_ENCODE_PROMPT_MAX_CHARS सेट करने पर encode
+        # के लिए prompt को उतने chars तक छाँट देते हैं (शुरुआती हिस्सा — identity/style core
+        # रखते हुए)। ⚠️ इससे prompt-adherence घटती है, इसलिए default OFF।
+        _enc_text = prompt_text
+        try:
+            _maxc = int(os.environ.get("LTX_ENCODE_PROMPT_MAX_CHARS", "0"))
+        except Exception:
+            _maxc = 0
+        if _maxc > 0 and len(_enc_text) > _maxc:
+            _enc_text = _enc_text[:_maxc]
+            print(f"  ✂️ Prompt trimmed for encode: {len(prompt_text)} → {_maxc} chars "
+                  f"(LTX_ENCODE_PROMPT_MAX_CHARS) — VRAM बचाने के लिए, पर fidelity थोड़ी घटेगी।")
+
         print("  ⚡ Encoding global prompt on GPU...")
         with torch.inference_mode():
-            cond_raw = gv(call_node("CLIPTextEncode", text=prompt_text, clip=clip), 0)
+            cond_raw = gv(call_node("CLIPTextEncode", text=_enc_text, clip=clip), 0)
             cond_cpu = sync_cond_to_cpu(cond_raw)
             del cond_raw
     except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
@@ -2307,12 +2322,13 @@ def encode_prompt_on_gpu(prompt_text: str):
                if torch.cuda.is_available() else 0.0)
         if _use_gguf_enc:
             _msg = (
-                f"GGUF encoder ({_enc_name}) इस T4 (~{_vg:.1f}GB) पर VRAM में fit नहीं हुआ।\n"
-                f"  ⚠️ ज़रूरी: यह cell दोबारा चलाने से पहले RUNTIME RESTART करें "
-                f"(Runtime → Restart session)। बिना restart के पिछले attempt का ~9.5GB "
-                f"encoder VRAM में पड़ा रहता है और अगला load तुरंत OOM करता है।\n"
-                f"  fresh kernel में यह ~0.5GB से चूकता है — तब भी न चले तो MODEL_FAMILY='2.3' "
-                f"(T4 पर पक्का) या L4/A100 (24GB+) इस्तेमाल करें।")
+                f"GGUF encoder ({_enc_name}) load तो हुआ (~10GB) पर उसका forward pass T4 "
+                f"(~{_vg:.1f}GB) की बची VRAM से ज़्यादा माँगता है — यानी encoder खुद T4 पर नहीं समाता\n"
+                f"  (यह Lightricks की '24GB+' requirement से मेल खाता है)।\n"
+                f"  🔧 आख़िरी सस्ता lever (कोशिश के लायक): prompt छोटा करके encode की activations घटाएँ —\n"
+                f"       import os; os.environ['LTX_ENCODE_PROMPT_MAX_CHARS']='1200'   # फिर RESTART + re-run\n"
+                f"     (इससे fidelity घटेगी; कई GB चाहिए तो शायद फिर भी कम पड़े।)\n"
+                f"  ✅ पक्का काम: MODEL_FAMILY='2.3' (T4 पर पूरा चलता है) या L4/A100 (24GB+) पर LTX-2.5।")
         else:
             _msg = (
                 f"Text-encoder ({_enc_name}) VRAM में fit नहीं हुआ (GPU ~{_vg:.1f}GB)।\n"
