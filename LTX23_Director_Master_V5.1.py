@@ -779,8 +779,40 @@ def purge_deep(tag: str = ""):
     malloc_trim_os()
 
 def free_models_no_cpu_offload(tag: str = ""):
+    """Discard loaded-model GPU weights WITHOUT offloading them to host RAM.
+
+    On a free T4 the DiT is ~11 GB while free host RAM is often < 6 GB after
+    Phase B. ComfyUI's normal unload MOVES weights to the CPU offload device,
+    which overflows host RAM and FATALLY crashes the kernel. Simply clearing
+    ComfyUI's loaded-model list (the old V5/V5.1 approach) is ALSO insufficient
+    here: GGUF ModelPatcher clones created by LTXDirectorGuide keep the weight
+    tensors alive on the GPU, so torch.cuda.empty_cache() cannot reclaim them —
+    which is exactly why Phase C's VAE decode OOM'd with ~11 GB still resident.
+
+    Fix: send every loaded model's weight tensors to the 'meta' device. This
+    releases the CUDA storage INSTANTLY and uses ZERO host RAM, regardless of any
+    lingering Python references to the (now-hollow) ModelPatcher. The model is
+    never reused after this point — Phase C/D only need latents + the VAE — and a
+    resume reloads the DiT fresh via _ensure_model()/load_dit_and_loras().
+    """
+    freed = False
     try:
         import comfy.model_management as mm
+        loaded = list(getattr(mm, "current_loaded_models", []) or [])
+        for lm in loaded:
+            # LoadedModel.model -> ModelPatcher; ModelPatcher.model -> BaseModel (nn.Module)
+            mp = getattr(lm, "model", None)
+            base = getattr(mp, "model", None) if mp is not None else None
+            targets = [base]
+            if base is not None:
+                targets.append(getattr(base, "diffusion_model", None))
+            for target in targets:
+                try:
+                    if target is not None and hasattr(target, "to"):
+                        target.to(device="meta")   # drop CUDA storage, no host-RAM move
+                        freed = True
+                except Exception:
+                    pass
         if hasattr(mm, "current_loaded_models") and isinstance(mm.current_loaded_models, list):
             mm.current_loaded_models.clear()
         try:
@@ -789,13 +821,16 @@ def free_models_no_cpu_offload(tag: str = ""):
             pass
     except Exception:
         pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    gc.collect()
+    for _ in range(3):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
     drop_os_page_cache()
     malloc_trim_os()
+    if freed:
+        log(f"DiT weights discarded to meta device — VRAM reclaimed"
+            f"{(' · ' + tag) if tag else ''}.", "DEBUG")
 
 def ram_guard(min_free_gb: float = 2.0, tag: str = ""):
     if get_ram_free_gb() < min_free_gb:
@@ -876,16 +911,21 @@ def configure_vram_state(mode: str = "auto"):
         if mode == "highvram":
             mm.vram_state = vs.HIGH_VRAM
             mm.unet_offload_device = lambda: dev
+            print("  ⚙️ VRAM → HIGH_VRAM (whole model on GPU — needs L4/A100).")
         elif mode == "lowvram":
             mm.vram_state = vs.LOW_VRAM
+            print("  ⚙️ VRAM → LOW_VRAM (layer-by-layer streaming).")
         elif mode == "novram":
             mm.vram_state = vs.NO_VRAM
+            print("  ⚙️ VRAM → NO_VRAM (maximum streaming, slowest).")
         elif mode == "normalvram":
             mm.vram_state = vs.NORMAL_VRAM
+            print("  ⚙️ VRAM → NORMAL_VRAM (recommended on a T4).")
         else:
             mm.vram_state = vs.NORMAL_VRAM
+            print("  ⚙️ VRAM → auto → NORMAL_VRAM (recommended on a T4).")
     except Exception as e:
-        pass
+        print(f"  [vram-state notice] {e}")
 
 patch_comfy_memory_manager()
 patch_safetensors_direct_to_gpu()
@@ -1091,15 +1131,19 @@ def call_node(node_name: str, node_instance: Optional[Any] = None, **kwargs) -> 
         raise RuntimeError(f"Error calling node '{node_name}':\n{last_err}")
     raise AttributeError(f"No callable function found on node '{node_name}'.")
 
-def tiled_decode_video(video_latent: Any, vae_obj: Any, tile_size: int = 256) -> torch.Tensor:
+def tiled_decode_video(video_latent: Any, vae_obj: Any, tile_size: int = 192) -> torch.Tensor:
+    """Out-of-core VAE decode. On a T4 the LTX-2.5 VAE decoder is attention-heavy,
+    so we tile aggressively (more spatial tiles, shorter temporal window, smaller
+    tile_size) to keep peak VRAM low. Falls back through progressively simpler
+    decoders if a custom tiled node is unavailable."""
     lat = unwrap_latent(video_latent)
     if "LTXVSpatioTemporalTiledVAEDecode" in NODE_CLASS_MAPPINGS:
         try:
             return unwrap_tensor(call_node(
                 "LTXVSpatioTemporalTiledVAEDecode",
                 vae=vae_obj, latents=lat,
-                spatial_tiles=2, spatial_overlap=8,
-                temporal_tile_length=16, temporal_overlap=4,
+                spatial_tiles=4, spatial_overlap=8,
+                temporal_tile_length=8, temporal_overlap=2,
                 last_frame_fix=False, working_device="auto", working_dtype="auto"))
         except Exception:
             pass
@@ -1687,8 +1731,10 @@ print("✅ Cell 13: Phase B ready.")
 # ════════════════════════════════════════════════════════════════════════════
 # CELL 14: PHASE C — CHUNKED STREAMING VAE DECODE (LTX-2.5 VAEs)
 # ════════════════════════════════════════════════════════════════════════════
-# 🛡️ THE FIX: Reduced from 8 to 5 chunk latent frames to guarantee VAE 3D-convolution safety.
-DECODE_CHUNK_LAT_FRAMES = 5
+# 🛡️ THE FIX: small temporal chunk keeps the LTX-2.5 VAE 3D-conv/attention peak
+# low on a T4. 4 latent frames (~29 px frames) decodes safely once the DiT has
+# been freed from VRAM (see free_models_no_cpu_offload).
+DECODE_CHUNK_LAT_FRAMES = 4
 DECODE_CHUNK_OVERLAP = 1
 
 def _save_audio_wav(audio_dict: Any, wav_path: str, fallback_sr: int = 48000) -> bool:
@@ -1709,6 +1755,38 @@ def _save_audio_wav(audio_dict: Any, wav_path: str, fallback_sr: int = 48000) ->
         return os.path.exists(wav_path) and os.path.getsize(wav_path) > 100
     except Exception:
         return False
+
+def _decode_video_sub_safe(sub: torch.Tensor, vae_obj: Any) -> torch.Tensor:
+    """Decode a temporal sub-latent [B,C,t,H,W] to pixel frames [T,H,W,3] on CPU,
+    with a memory-survival ladder so one heavy chunk can't kill the whole render:
+      1) try progressively smaller VAE tiles (192 → 128 → 96),
+      2) as a last resort, split the sub-latent in half along the temporal axis
+         and decode each half recursively, then concatenate.
+    A recovered (split) decode may show a faint seam at the split point — that is
+    an acceptable trade for not crashing on a 15 GB T4."""
+    for ts in (192, 128, 96):
+        try:
+            out = unwrap_tensor(tiled_decode_video({"samples": sub}, vae_obj, tile_size=ts)).clamp(0, 1)
+            return out.detach().cpu()
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            medium_clear("decode_tile_oom")
+
+    t = int(sub.shape[2]) if sub.dim() >= 3 else 1
+    if t <= 1:
+        # Cannot split further — one final attempt at the tiniest tile, else raise.
+        out = unwrap_tensor(tiled_decode_video({"samples": sub}, vae_obj, tile_size=64)).clamp(0, 1)
+        return out.detach().cpu()
+
+    mid = t // 2
+    log(f"VAE decode OOM — splitting {t} latent frames → {mid}+{t - mid} "
+        f"(may add a faint seam, avoids a crash).", "WARN")
+    left = _decode_video_sub_safe(sub[:, :, :mid], vae_obj)
+    medium_clear("decode_split")
+    right = _decode_video_sub_safe(sub[:, :, mid:], vae_obj)
+    return torch.cat([left, right], dim=0)
+
 
 def execute_phase_c(latent_file: str, workdir: str, fps: int, crf: int,
                     resume: bool = True) -> Tuple[str, str]:
@@ -1736,7 +1814,7 @@ def execute_phase_c(latent_file: str, workdir: str, fps: int, crf: int,
             
         v_full = unwrap_latent({"samples": pack["video"]})["samples"]
         T = int(v_full.shape[2]) if (v_full is not None and v_full.dim() >= 3) else 1
-        chunk = max(2, int(globals().get("DECODE_CHUNK_LAT_FRAMES", 5)))
+        chunk = max(2, int(globals().get("DECODE_CHUNK_LAT_FRAMES", 4)))
         ov = max(0, int(globals().get("DECODE_CHUNK_OVERLAP", 1)))
 
         chunk_ranges, start = [], 0
@@ -1755,12 +1833,12 @@ def execute_phase_c(latent_file: str, workdir: str, fps: int, crf: int,
             with torch.inference_mode():
                 ctx = max(0, s - ov) if s > 0 else 0
                 sub = v_full[:, :, ctx:e].float()
-                
-                # Fetch output and IMMEDIATELY detach and shift to CPU to clear VRAM cache payload
-                frames_tensor = unwrap_tensor(tiled_decode_video({"samples": sub}, video_vae, tile_size=256)).clamp(0, 1)
-                frames_cpu = frames_tensor.detach().cpu().numpy()
-                del frames_tensor, sub
-                
+
+                # Decode with an OOM-retry ladder (shrink tile → split in time),
+                # landing straight on CPU so no full-res RGB is held on the GPU.
+                frames_cpu = _decode_video_sub_safe(sub, video_vae).numpy()
+                del sub
+
                 drop_px = (s - ctx) * 8 if s > 0 else 0
                 fslice = frames_cpu[drop_px:] if drop_px > 0 else frames_cpu
                 arr = (fslice * 255.0).astype(np.uint8)
@@ -2013,6 +2091,9 @@ def run_ltx25_director_master(global_prompt, negative_prompt, meta, segments,
             latent_file = execute_phase_b(director_state, patched_model, seed=seed,
                                           workdir=workdir, resume=resume)
             del director_state, patched_model
+            # Discard the DiT straight from VRAM (no host-RAM offload) so the
+            # LTX-2.5 VAE decode in Phase C has the full T4 to itself.
+            free_models_no_cpu_offload("post_phase_b_master")
             purge_deep("post_phase_b_master")
             break
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
@@ -2023,6 +2104,11 @@ def run_ltx25_director_master(global_prompt, negative_prompt, meta, segments,
                 raise RuntimeError("CUDA OOM limit reached on T4.") from e
             active_meta = _scale_meta_resolution(base_meta, 0.8 ** attempt)
             log(f"OOM #{attempt}: Retrying at {active_meta['generation_width']}x{active_meta['generation_height']}", "WARN")
+
+    # Guarantee the DiT is gone before the VAE decode (covers the resume path,
+    # where Phase A+B were skipped but a stale model could still be resident).
+    free_models_no_cpu_offload("pre_phase_c")
+    mem_report("Pre Phase C", "DiT should be freed; VAE decode next")
 
     raw_video, audio_file = execute_phase_c(
         latent_file, workdir=workdir,
